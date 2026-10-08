@@ -566,3 +566,7 @@ uv run python benchmarks/bench_write.py --server 3 --points 500000
 On first start the compose stack generates random throwaway credentials into `docker/secrets/`
 (git-ignored), where the tests and benchmarks read them; the servers keep their data in memory.
 InfluxDB 3 Core allows five databases, so the tests share one.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
