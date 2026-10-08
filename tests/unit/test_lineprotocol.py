@@ -108,3 +108,44 @@ def test_escape_round_trip(dialect: Dialect) -> None:
         assert parsed.measurement == measurement, line
         assert parsed.tags == {tag_key: tag_value}, line
         assert parsed.fields == {field_key: string_value}, line
+
+
+class TestSplitLines:
+    @pytest.mark.parametrize("dialect", [V2, V3], ids=["v2", "v3"])
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("m x=1 1\nm x=2 2\r\n# comment\n\nm x=3", ["m x=1 1", "m x=2 2", "m x=3"]),
+            ('m s="two\nlines" 1\nm x=1', ['m s="two\nlines" 1', "m x=1"]),
+            ('m s="a\r\nb"\r\nm x=1\r\n', ['m s="a\r\nb"', "m x=1"]),  # CR LF kept inside the value
+            ('m s="q\\"\n\\\\" 1\nm x=1', ['m s="q\\"\n\\\\" 1', "m x=1"]),  # escaped quote and backslash
+            # Quotes in tags and field keys are literal: only one right after "=" opens a string.
+            ('m,t=q"uote x=1\nm k"ey=1,s="x\n" 2', ['m,t=q"uote x=1', 'm k"ey=1,s="x\n" 2']),
+            ('# say "hi\nm s="x" 1\n#"', ['m s="x" 1']),  # quotes in comments open nothing
+            ('m s="unterminated\nm x=1', ['m s="unterminated', "m x=1"]),  # invalid: newline ends it
+            ('m s="one line" 1', ['m s="one line" 1']),
+            ("", []),
+        ],
+    )
+    def test_newlines_in_string_values_do_not_end_lines(
+        self, dialect: Dialect, text: str, expected: list[str]
+    ) -> None:
+        assert dialect.split_lines(text) == expected
+
+    @pytest.mark.parametrize("dialect", [V2, V3], ids=["v2", "v3"])
+    def test_random_lines_round_trip(self, dialect: Dialect) -> None:
+        rng = random.Random(4321)
+        for _ in range(300):
+            lines = []
+            for _ in range(rng.randint(1, 6)):
+                measurement = random_identifier(rng).lstrip("#") or "m"
+                tag = f"{dialect.escape_key(random_identifier(rng))}={dialect.escape_key(random_identifier(rng))}"
+                value = "".join(rng.choice([*ALPHABET, "\n", "\r\n"]) for _ in range(rng.randint(0, 10)))
+                quoted = value.replace("\\", "\\\\").replace('"', '\\"')
+                field = f'{dialect.escape_key(random_identifier(rng))}="{quoted}",n=1i'
+                lines.append(
+                    f"{dialect.escape_measurement(measurement)},{tag} {field}" + rng.choice(["", " 5"])
+                )
+            noise = rng.choice(["", '# a "comment\n', "\n"])
+            text = noise + "\n".join(lines) + rng.choice(["", "\n", "\r\n"])
+            assert dialect.split_lines(text) == lines, text

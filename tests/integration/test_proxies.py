@@ -6,6 +6,7 @@ The nginx test needs ``docker compose --profile network up -d --wait``.
 from __future__ import annotations
 
 import http.client
+import logging
 import select
 import socket
 import threading
@@ -86,6 +87,27 @@ def test_reverse_proxy_body_limit_is_learned(server_version: int, unique: str, c
     with server_client(server_version, CollectorRegistry()) as direct:
         assert stored(direct, unique) == n
         assert stored(direct, unique + "_again") == n
+
+
+def test_batch_byte_limit_counts_utf8_bytes(server_version: int, unique: str, caplog: Any) -> None:
+    """Multi-byte text must not inflate requests past max_batch_bytes (and the proxy's limit)."""
+    if not reachable(NGINX[server_version]):
+        pytest.skip("nginx not running (docker compose --profile network up -d --wait)")
+    caplog.set_level(logging.DEBUG, logger="sluicebox")
+    limit = 200_000  # below nginx's 256k, but not if characters were counted as bytes
+    text = "漢字" * 70
+    write = {"gzip": False, "max_batch_bytes": limit, "flush_interval": 60}
+    with make_client(server_version, NGINX[server_version], write=write) as client:
+        for i in range(2000):
+            client.write({"measurement": unique, "fields": {"s": f"{text}{i}"}, "time": T0_NS + i * 1000})
+        client.flush()
+        stats = client.stats().write
+        assert client._engine._max_batch_bytes == limit  # no 413 to learn from
+    assert not [r for r in caplog.records if "too large" in r.getMessage()]
+    expected = sum(len(f'{unique} s="{text}{i}" {T0_NS + i * 1000}'.encode()) + 1 for i in range(2000))
+    assert stats.bytes_raw == expected
+    with server_client(server_version, CollectorRegistry()) as direct:
+        assert stored(direct, unique) == 2000
 
 
 class _ForwardProxy(BaseHTTPRequestHandler):

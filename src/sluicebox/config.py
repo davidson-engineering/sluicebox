@@ -311,7 +311,10 @@ class ValidationConfig(_Model):
     max_string_bytes: Bytes = Field(default=Bytes(1024 * 1024), ge=1, description="Server limit is 1 MiB.")
     raw_lines: Literal["passthrough", "validate"] = Field(
         default="passthrough",
-        description="Raw line protocol input: send as-is (fastest), or parse it and apply validation/tags.",
+        description=(
+            "Raw line protocol input: send as-is (fastest; untimed lines still get the write() time), "
+            "or parse it and apply validation/tags."
+        ),
     )
 
 

@@ -196,6 +196,45 @@ class TestTimestamps:
         ).lines
         assert out == ["m v=1.0 5"] * 3
 
+    @pytest.mark.parametrize("raw_lines", ["passthrough", "validate"])
+    def test_untimed_raw_lines_get_the_write_time(self, raw_lines: str) -> None:
+        s = Serializer(
+            dialect=Dialect.for_version(3),
+            validation=ValidationConfig(raw_lines=raw_lines),
+            schemas={},
+            injector=TagInjector(TagsConfig()),
+            auto_timestamp=True,
+        )
+        text = 'a x=1\nb x=1 7\nc x=1 -7\nd x=1 \ne s="sp 1" \nf s="multi\nline 1",y=2\ng x=1 8 '
+        out = s.serialize([text], database="db", precision="s", now_ns=5_000_000_000).lines
+        expected = ["a x=1 5", "b x=1 7", "c x=1 -7", "d x=1 5", 'e s="sp 1" 5', 'f s="multi\nline 1",y=2 5']
+        if raw_lines == "passthrough":
+            assert out == [*expected, "g x=1 8 "]
+        else:
+            assert out == [line.replace("=1 ", "=1.0 ").replace("y=2", "y=2.0") for line in expected] + [
+                "g x=1.0 8"
+            ]
+
+    def test_raw_lines_are_not_stamped_without_auto_timestamp(self) -> None:
+        assert lines(make(), "m x=1\nm x=2 3") == ["m x=1", "m x=2 3"]
+
+
+class TestByteCounts:
+    """``nbytes`` is the UTF-8 size of the lines plus newlines: it drives the batch and buffer limits."""
+
+    @pytest.mark.parametrize("raw_lines", ["passthrough", "validate"])
+    def test_non_ascii_lines_count_bytes_not_characters(self, raw_lines: str) -> None:
+        s = make(raw_lines=raw_lines)
+        records = [
+            {"measurement": "m", "fields": {"s": "漢字" * 70}, "time": 1},
+            {"measurement": "m", "fields": {"s": "ascii"}, "time": 2},
+            'm s="😀" 3\nm x=1i 4',
+            b'm s="\xc3\xa9" 5',
+        ]
+        chunk = s.serialize(records, database="db", precision="ns")
+        assert chunk.nbytes == sum(len(line.encode()) + 1 for line in chunk.lines)
+        assert chunk.nbytes > sum(len(line) + 1 for line in chunk.lines)
+
 
 class TestTypeLocking:
     def test_int_then_float_conflicts_with_hint(self) -> None:
@@ -360,6 +399,11 @@ class TestValidation:
         assert chunk.lines == ["m v=1i"]
         assert chunk.dropped == 2
         assert [(e.code, n) for e, n in s.drops] == [("type_conflict", 1), ("malformed_record", 1)]  # type: ignore[attr-defined]
+
+    def test_raw_string_values_may_span_lines(self) -> None:
+        text = 'm x=1.0 1\nm s="two\nlines" 2\n'
+        assert lines(make(), text) == ["m x=1.0 1", 'm s="two\nlines" 2']
+        assert lines(make(raw_lines="validate"), text) == ["m x=1.0 1", 'm s="two\nlines" 2']
 
     def test_raw_lines_validate_mode(self) -> None:
         s = make(raw_lines="validate", tags=TagsConfig(static={"env": "test"}))

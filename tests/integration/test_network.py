@@ -254,6 +254,32 @@ def test_lost_responses_do_not_duplicate_points(
     assert count(direct, unique) == n  # each retry re-wrote identical points: overwritten, not added
 
 
+def test_lost_responses_do_not_duplicate_untimed_line_protocol(
+    proxied: Callable[..., InfluxClient],
+    direct: InfluxClient,
+    toxiproxy: Toxiproxy,
+    server_version: int,
+    unique: str,
+) -> None:
+    """Raw lines without a timestamp get the write() time, so the retry overwrites them too."""
+    proxy = proxy_name(server_version)
+    toxiproxy.add(proxy, "blackhole", "timeout", "downstream", timeout=0)
+    timer = threading.Timer(3.0, toxiproxy.remove, (proxy, "blackhole"))
+    timer.start()
+    n = 2_000
+    client = proxied(
+        connection={"timeout": 1.5},
+        write={"retry": {"max_attempts": 20, "initial_delay": 0.2, "max_delay": 1.0}},
+    )
+    try:
+        text = "\n".join(f"{unique},host=h{i} v={float(i)}" for i in range(n))
+        assert client.write(text).result(timeout=120).points == n
+    finally:
+        timer.cancel()
+    assert client.stats().write.retries >= 1
+    assert count(direct, unique) == n  # server-assigned times would have stored every retry anew
+
+
 def test_outage_then_recovery(
     proxied: Callable[..., InfluxClient],
     direct: InfluxClient,

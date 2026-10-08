@@ -130,10 +130,10 @@ Timestamps may be ints in the write precision, timezone-aware `datetime`s, ISO 8
 (nanoseconds kept), float epoch seconds, or numpy/pandas timestamps and integers. Values
 InfluxDB cannot store (before 1677 or after 2262) are rejected; integer timestamps that land
 before 1973 log a warning, since that is what epoch seconds written with `precision="ns"` look
-like. Points without a timestamp get the time of the `write()` call (`write.auto_timestamp`),
-which makes retries idempotent. Untimed points of the same series written in one call therefore
-share a timestamp and overwrite each other, as with server-assigned times; sluicebox logs a
-warning when that happens.
+like. Points without a timestamp (raw line protocol too) get the time of the `write()` call
+(`write.auto_timestamp`), which makes retries idempotent. Untimed points of the same series
+written in one call therefore share a timestamp and overwrite each other, as with server-assigned
+times; sluicebox logs a warning when that happens (except for raw lines passed through unparsed).
 
 DataFrames: a column named `time` (or a datetime column named `timestamp`, or a pandas
 `DatetimeIndex`) is the timestamp unless `time_column=` says otherwise; it may hold datetimes,
@@ -306,8 +306,11 @@ Codes: `type_conflict`, `non_finite`, `out_of_range`, `string_too_long`, `invali
 `naive_datetime`, `malformed_record`, `unsupported_type`, `unsupported_record`, `invalid_line`,
 `invalid_encoding`.
 
-Raw line protocol is passed through unchanged by default (fastest); `raw_lines = "validate"`
-parses it so validation and tag injection apply too.
+Raw line protocol is passed through unchanged by default (fastest), except that lines without a
+timestamp get the `write()` time like any other point; `raw_lines = "validate"` parses it so
+validation and tag injection apply too. Either way, a newline inside a quoted string field value
+belongs to the value, so the output of `to_line_protocol()` and `WriteFailure.lines` can be
+written back as is.
 
 ```toml
 [validation]
