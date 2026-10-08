@@ -286,7 +286,7 @@ Every record is checked while it is serialized, before anything is buffered:
 
 | Check | Behaviour |
 | --- | --- |
-| Field type lock (`type_lock`) | The first type written for a field is kept; later values must match. Safe coercions apply (`coerce`): int to float, integral float to int. Booleans never become numbers. A record that is rejected locks nothing. |
+| Field type lock (`type_lock`) | The first type written for a field is kept; later values must match. Safe coercions apply (`coerce`): int to float, integral float to int. Booleans never become numbers. A record that is rejected locks nothing, nor does a DataFrame write in which no row is written. |
 | Server types | When the server rejects a value because it stores the field with another type, the lock follows the server's type. `client.sync_schema()` learns all stored types up front. |
 | Declared schemas | `[measurements.<name>]`: field types, allowed and required tags, required fields, `extra_fields = "forbid"`. `unknown_measurements = "reject"` allows only declared measurements. |
 | Identifiers | Escaped per server version; names that cannot round-trip are rejected (trailing backslash, control characters, reserved keys, `#`-prefixed measurements, `=` in InfluxDB 2 measurement names, tag/field name clashes on InfluxDB 3). |

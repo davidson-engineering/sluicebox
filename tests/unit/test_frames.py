@@ -14,11 +14,13 @@ from sluicebox._serializer import Serializer
 from sluicebox.config import MeasurementSchema, TagRule, TagsConfig, ValidationConfig
 from sluicebox.frames import to_line_chunks
 from sluicebox.tags import TagInjector, tag_context
+from sluicebox.types import FieldType
 
 # polars publishes no free-threaded (3.14t) wheels; CI runs that build without it.
 pl = pytest.importorskip("polars")
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
+T0_NS = 1_704_067_200_000_000_000
 
 
 def make(
@@ -205,6 +207,55 @@ def test_raise_mode_reports_first_bad_row() -> None:
     with pytest.raises(ValidationError) as info:
         frame_lines(make(), frame, tag_columns=["host"])
     assert (info.value.code, info.value.index, info.value.key) == ("invalid_tag_value", 1, "host")
+
+
+class TestRejectedFramesLockNothing:
+    def test_a_rejected_frame_locks_no_types_and_registers_no_tag_keys(self) -> None:
+        serializer = make()
+        frame = pl.DataFrame({"host": ["a\\"], "x": [1]})
+        with pytest.raises(ValidationError, match="trailing backslash"):
+            frame_lines(serializer, frame, tag_columns=["host"])
+        assert serializer.locked_types("db", "m") == {}
+        # A float for x and a field named host are both still fine (host would clash on v3).
+        assert lines(serializer, {"measurement": "m", "fields": {"x": 1.5, "host": "h"}, "time": T0_NS}) == [
+            'm x=1.5,host="h" 1704067200000000000'
+        ]
+
+    def test_a_frame_whose_rows_are_all_dropped_locks_nothing(self) -> None:
+        serializer = make(on_invalid="drop")
+        written, dropped = frame_lines(
+            serializer, pl.DataFrame({"host": ["a\\", "b\\"], "x": [1, 2]}), tag_columns=["host"]
+        )
+        assert (written, dropped) == ([], 2)
+        assert serializer.locked_types("db", "m") == {}
+
+    def test_written_rows_keep_their_locks(self) -> None:
+        serializer = make(on_invalid="drop")
+        frame = pl.DataFrame({"host": ["a\\", "b"], "x": [1, 2], "time": [T0, T0]})
+        written, dropped = frame_lines(serializer, frame, chunk_size=1, tag_columns=["host"])
+        assert (len(written), dropped) == (1, 1)
+        assert serializer.locked_types("db", "m") == {"x": FieldType.INTEGER}
+
+    def test_existing_registrations_survive_a_rejected_frame(self) -> None:
+        serializer = make()
+        lines(serializer, {"measurement": "m", "tags": {"host": "a"}, "fields": {"x": 1}, "time": T0_NS})
+        with pytest.raises(ValidationError):
+            frame_lines(serializer, pl.DataFrame({"host": ["a\\"], "x": [1]}), tag_columns=["host"])
+        assert serializer.locked_types("db", "m") == {"x": FieldType.INTEGER}
+        assert (
+            error_code(serializer, {"measurement": "m", "fields": {"host": 1.0}, "time": T0_NS})
+            == "tag_field_conflict"
+        )
+
+
+def lines(serializer: Serializer, *records: Any) -> list[str]:
+    return serializer.serialize(list(records), database="db", precision="ns").lines
+
+
+def error_code(serializer: Serializer, record: Any) -> str:
+    with pytest.raises(ValidationError) as info:
+        lines(serializer, record)
+    return info.value.code
 
 
 def test_rows_with_no_fields_are_invalid() -> None:
