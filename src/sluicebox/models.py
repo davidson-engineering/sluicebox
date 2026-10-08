@@ -177,6 +177,15 @@ def _build_spec(cls: type, name: str, tag_names: set[str], timestamp: str | None
     unknown = tag_names - set(attributes)
     if unknown:
         raise ConfigurationError(f"@measurement tags {sorted(unknown)} are not attributes of {cls.__name__}")
+    if timestamp is not None:
+        if timestamp not in attributes:
+            raise ConfigurationError(
+                f"@measurement timestamp {timestamp!r} is not an attribute of {cls.__name__}"
+            )
+        if timestamp in tag_names:
+            raise ConfigurationError(
+                f"@measurement attribute {timestamp!r} cannot be both a tag and the timestamp"
+            )
     for attr in attributes:
         base, metadata = _unwrap(hints.get(attr, Any))
         marker_tag = next((m for m in metadata if m is Tag or isinstance(m, Tag)), None)

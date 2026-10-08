@@ -611,6 +611,20 @@ class TestModels:
         line = one(make(), Reading(region="eu", sensor="s1", value=None, state="ok", stamp=5))
         assert line == 'Reading,region=eu,sensor_id=s1 state="ok" 5'
 
+    def test_timestamp_argument_must_name_an_attribute(self) -> None:
+        from sluicebox import ConfigurationError
+
+        @dataclass
+        class Sample:
+            v: float
+            at: int
+
+        with pytest.raises(ConfigurationError, match="timestamp 'nope' is not an attribute of Sample"):
+            measurement("m", timestamp="nope")(Sample)
+        with pytest.raises(ConfigurationError, match="both a tag and the timestamp"):
+            measurement("m", tags=("at",), timestamp="at")(Sample)
+        assert one(make(), measurement("m", timestamp="at")(Sample)(1.0, 5)) == "m v=1.0 5"
+
     def test_undecorated_dataclass_hint(self) -> None:
         @dataclass
         class Plain:

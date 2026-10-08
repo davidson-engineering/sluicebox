@@ -53,6 +53,19 @@ requires_polars = pytest.mark.skipif(find_spec("polars") is None, reason="polars
 
 
 class TestMetrics:
+    def test_every_metric_is_documented(self, client: InfluxClient, registry: CollectorRegistry) -> None:
+        import re
+
+        import sluicebox.metrics
+
+        documented = dict(re.findall(r"^``(\w+)``\s+(\w+)", sluicebox.metrics.__doc__ or "", re.MULTILINE))
+        suffix = {"counter": "_total", "info": "_info"}
+        registered = {
+            family.name.removeprefix("sluicebox_") + suffix.get(family.type, ""): family.type
+            for family in registry.collect()
+        }
+        assert registered == documented
+
     def test_write_metrics(self, client: InfluxClient, registry: CollectorRegistry) -> None:
         client.write([{"measurement": "m", "fields": {"v": float(i)}} for i in range(5)]).result(timeout=5)
         assert sample(registry, "sluicebox_points_written_total", client="obs", database="db") == 5
