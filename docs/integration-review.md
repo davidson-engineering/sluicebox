@@ -1,6 +1,6 @@
 # First-time integration review
 
-What it was like to integrate influxkit for the first time, what got in the way, and what was
+What it was like to integrate sluicebox for the first time, what got in the way, and what was
 changed as a result. Reviewed 2026-10-08 against the code as of the initial commit.
 
 ## How the review was done
@@ -33,7 +33,7 @@ Severity is the highest any reviewer gave the finding. "Fixed" means changed in 
 
 | # | Finding | Found by | Status |
 | --- | --- | --- | --- |
-| 1 | **Exiting without `close()` hung for the full close timeout, then lost every buffered point.** urllib3 drains its connection pools from a `weakref.finalize` hook at exit, and that hook ran before influxkit's flush. | service, SRE | Fixed: the exit flush is registered so it runs first, pool waits are bounded, and data lost at exit is printed to stderr when logging is not configured. Tested end to end on both servers. |
+| 1 | **Exiting without `close()` hung for the full close timeout, then lost every buffered point.** urllib3 drains its connection pools from a `weakref.finalize` hook at exit, and that hook ran before sluicebox's flush. | service, SRE | Fixed: the exit flush is registered so it runs first, pool waits are bounded, and data lost at exit is printed to stderr when logging is not configured. Tested end to end on both servers. |
 | 2 | **`version = 3` settings pointed at an InfluxDB 2 server reported success and stored nothing.** InfluxDB 2 answers `/api/v3/write_lp` with its web UI and HTTP 200. | batch, SRE | Fixed: a web page is never a successful write; the error names the likely cause. New `client.check()` compares the server's version with the settings. |
 | 3 | **A 30 s outage lost 45% of the data.** `max_attempts = 5` gave up after about 7 s, long before `max_elapsed = 5m` mattered. | service, SRE | Fixed: attempts are unlimited by default and `max_elapsed` bounds retrying. A long `Retry-After` gets a final attempt at the deadline instead of ending retries. |
 | 4 | **`close(timeout)` silently abandoned requests still in flight.** It overran its timeout (7 s for 5 s; 16 s+ at the default concurrency), and points were neither failed nor counted. | SRE, review | Fixed: in-flight batches are failed and reported (futures, `on_error`, `WriteError`, metrics), and the timeout is one deadline. `close_timeout` default 30 s → 20 s, below Kubernetes' grace period. |
@@ -53,7 +53,7 @@ Severity is the highest any reviewer gave the finding. "Fixed" means changed in 
 | 13 | Integer seconds written with `precision = "ns"` silently landed in 1970. | batch | Fixed: integer timestamps before 1973 are logged as a likely unit mistake, and out-of-range timestamps (ISO, float, numpy, per precision) are rejected client-side. |
 | 14 | `ping()` passed with a wrong token, bucket or version; problems surfaced only on the first background write. | batch, service | Fixed: `client.check()` (version, token, org, bucket via an empty write). |
 | 15 | Docs and examples used unbounded tags (`request_id`, a timestamp), with no cardinality guidance or warning. | service | Fixed: a "Choosing tags" section, corrected examples, and a warning after 150,000 tag sets per measurement. |
-| 16 | Typo'd `INFLUXKIT_*` environment variables (e.g. `INFLUXKIT_DATABASE`) were silently ignored, while the same typo in `.env` was an error. | SRE | Fixed: they are logged with the setting they probably meant. Nested typos are errors that name the variable. |
+| 16 | Typo'd `SLUICEBOX_*` environment variables (e.g. `SLUICEBOX_DATABASE`) were silently ignored, while the same typo in `.env` was an error. | SRE | Fixed: they are logged with the setting they probably meant. Nested typos are errors that name the variable. |
 | 17 | Logs did not fit a JSON pipeline: `JsonFormatter` dropped `extra=` fields, records carried no structured context, and `configure = true` silently stopped propagation. | SRE | Fixed: extras and structured context (client, database, points, error, status, code, measurement, key); propagation documented; `configure_logging(level=, format=)`. |
 | 18 | No signals to alert on: counters had no series until their first event, and there was no buffer capacity, learned size limit or last-success time. | SRE | Fixed: zero-initialized counters, `write_buffer_limit_bytes`, `write_max_batch_bytes`, `write_last_success_timestamp_seconds`, and suggested alerts in the README. |
 | 19 | A second process with `[metrics] port` died with a bare `OSError: Address already in use`. | SRE | Fixed: a `ConfigurationError` that explains the multi-process options. |
@@ -69,8 +69,8 @@ Severity is the highest any reviewer gave the finding. "Fixed" means changed in 
 | --- | --- |
 | Install instructions only worked for a package index | Fixed: path and git installs documented |
 | Quick start needed polars with only the `v3` extra; dependency hints said `pip` | Fixed: the quick start iterates rows; hints name uv and pip |
-| `influxkit.example.toml` could not be copied as is: an active strict `cpu` schema broke the README quick start, and `from_env = AWS_REGION` failed without that variable | Fixed: optional sections are commented out (a test checks they stay valid) |
-| A missing token showed up only as a bare 401; `.env` is looked up relative to the working directory | Fixed: the 401 says no token is configured and where it looked; `INFLUXKIT_TOKEN_FILE` |
+| `sluicebox.example.toml` could not be copied as is: an active strict `cpu` schema broke the README quick start, and `from_env = AWS_REGION` failed without that variable | Fixed: optional sections are commented out (a test checks they stay valid) |
+| A missing token showed up only as a bare 401; `.env` is looked up relative to the working directory | Fixed: the 401 says no token is configured and where it looked; `SLUICEBOX_TOKEN_FILE` |
 | Config errors: generic message for a token under `[connection]`, no "did you mean", keyword typos attributed to the config file, a misleading message when no config file was found | Fixed |
 | `InfluxClient(settings, write=...)` raised `TypeError` | Fixed: overrides are merged (`settings.with_overrides()`) |
 | `configure_logging` needed the unexported `LoggingConfig` | Fixed: keywords, and `LoggingConfig` and `StageStats` are exported |
@@ -84,7 +84,7 @@ Severity is the highest any reviewer gave the finding. "Fixed" means changed in 
 | Failed queries were logged at WARNING and raised | Fixed: DEBUG, since they are raised |
 | `https://` against a plain-HTTP port gave a bare `WRONG_VERSION_NUMBER` | Fixed: a hint to use `http://` |
 | `from_env` had no optional form | Fixed: `{ var = "...", default = "..." }` |
-| No environment variable for the config section or secrets directory | Fixed: `INFLUXKIT_SECTION`, `INFLUXKIT_SECRETS_DIR` |
+| No environment variable for the config section or secrets directory | Fixed: `SLUICEBOX_SECTION`, `SLUICEBOX_SECRETS_DIR` |
 | `from_config(tags={"on_conflict": ...})` silently created a tag named `on_conflict` | Fixed: `TypeError` explaining the difference |
 | A proxy refusing every body made the client halve batches down to single lines (387 requests for 200 points) | Fixed: splitting stops at 1 KiB |
 | 256 MiB `max_pending_bytes` could mean about 0.8 GiB RSS | Default 128 MiB, and the about-3x factor is documented |

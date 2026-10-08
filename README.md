@@ -1,4 +1,4 @@
-# influxkit
+# sluicebox
 
 High-throughput, validated and observable writes and queries for **InfluxDB 2** and **InfluxDB 3**,
 built to drop into an application and push large volumes of data as fast as the server accepts them.
@@ -43,26 +43,30 @@ urllib3 transport, so ingest-only applications need neither.
 
 ## Install
 
-```bash
-uv add influxkit                    # writes only (urllib3, pydantic, prometheus-client)
-uv add 'influxkit[v3]'              # + InfluxDB 3 queries (influxdb3-python, pyarrow)
-uv add 'influxkit[v2]'              # + InfluxDB 2 queries (influxdb-client)
-uv add 'influxkit[polars]'          # + polars DataFrames (write them, or get query results as them)
-uv add 'influxkit[all]'             # all of the above plus pandas
-```
-
-From a checkout or a git repository instead of a package index:
+sluicebox is installed from GitHub (it is not on PyPI). Pick the extras you need:
 
 ```bash
-uv add '/path/to/influxkit[v3]'
-uv add 'influxkit[v3] @ git+https://example.com/your-org/influxkit.git'
+uv add 'sluicebox @ git+https://github.com/davidson-engineering/sluicebox'           # writes only
+uv add 'sluicebox[v3] @ git+https://github.com/davidson-engineering/sluicebox'       # + InfluxDB 3 queries
+uv add 'sluicebox[v2] @ git+https://github.com/davidson-engineering/sluicebox'       # + InfluxDB 2 queries
+uv add 'sluicebox[polars] @ git+https://github.com/davidson-engineering/sluicebox'   # + polars DataFrames
+uv add 'sluicebox[all] @ git+https://github.com/davidson-engineering/sluicebox'      # all, plus pandas
 ```
 
-Python 3.11+. `pip install` works the same way.
+| Extra | Adds | For |
+| --- | --- | --- |
+| (none) | urllib3, pydantic, pydantic-settings, prometheus-client | writes |
+| `v3` | influxdb3-python, pyarrow | InfluxDB 3 queries (SQL, InfluxQL) |
+| `v2` | influxdb-client | InfluxDB 2 queries (Flux) |
+| `polars`, `pandas` | polars / pandas | writing DataFrames, query results as DataFrames |
+| `all` | all of the above | |
+
+Append `@<tag-or-commit>` to the URL to pin a version. From a local checkout:
+`uv add '/path/to/sluicebox[v3]'`. Python 3.11+; `pip install` takes the same specifiers.
 
 ## Quick start
 
-`influxkit.toml` (non-secret settings; full reference in [`influxkit.example.toml`](influxkit.example.toml)):
+`sluicebox.toml` (non-secret settings; full reference in [`sluicebox.example.toml`](sluicebox.example.toml)):
 
 ```toml
 [connection]
@@ -74,13 +78,13 @@ database = "telemetry"   # bucket on InfluxDB 2
 `.env` (or real environment variables; never commit it):
 
 ```bash
-INFLUXKIT_TOKEN=apiv3_...
+SLUICEBOX_TOKEN=apiv3_...
 ```
 
 ```python
-from influxkit import InfluxClient, Point
+from sluicebox import InfluxClient, Point
 
-with InfluxClient.from_config() as client:  # reads ./influxkit.toml and ./.env
+with InfluxClient.from_config() as client:  # reads ./sluicebox.toml and ./.env
     client.check()  # fail fast: wrong URL, version, token or bucket
 
     # Asynchronous: returns immediately, sent in the background.
@@ -126,7 +130,7 @@ InfluxDB cannot store (before 1677 or after 2262) are rejected; integer timestam
 before 1973 log a warning, since that is what epoch seconds written with `precision="ns"` look
 like. Points without a timestamp get the time of the `write()` call (`write.auto_timestamp`),
 which makes retries idempotent. Untimed points of the same series written in one call therefore
-share a timestamp and overwrite each other, as with server-assigned times; influxkit logs a
+share a timestamp and overwrite each other, as with server-assigned times; sluicebox logs a
 warning when that happens.
 
 DataFrames: a column named `time` (or a datetime column named `timestamp`, or a pandas
@@ -140,7 +144,7 @@ Typed models declare their field types once, so they can never write an inconsis
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated
-from influxkit import Tag, measurement
+from sluicebox import Tag, measurement
 
 
 @measurement("cpu")
@@ -238,17 +242,17 @@ Every distinct combination of tag values is a series, and InfluxDB's cost grows 
 of series (InfluxDB 2 keeps an index of all series in memory). Tag values should come from a
 bounded set: host, region, service, endpoint, status class, sensor id. Values that are unique or
 unbounded (request ids, user or session ids, trace ids, timestamps, free text, measured values)
-belong in fields. influxkit logs a warning when a measurement exceeds 150,000 distinct tag sets
+belong in fields. sluicebox logs a warning when a measurement exceeds 150,000 distinct tag sets
 in one process.
 
 ## Configuration and secrets
 
 Settings come from, highest priority first: keyword overrides, environment variables
-(`INFLUXKIT_WRITE__BATCH_SIZE=50000`), a `.env` file, a secrets directory (one file per
-secret, e.g. Docker/Kubernetes `/run/secrets/influxkit_token`), the TOML file, then defaults.
+(`SLUICEBOX_WRITE__BATCH_SIZE=50000`), a `.env` file, a secrets directory (one file per
+secret, e.g. Docker/Kubernetes `/run/secrets/sluicebox_token`), the TOML file, then defaults.
 
 ```python
-load_settings("influxkit.toml")  # explicit file
+load_settings("sluicebox.toml")  # explicit file
 load_settings("app.toml", section="services.influx")  # a table inside your app's config
 load_settings(env_prefix="ARCHIVE_")  # a second client: ARCHIVE_TOKEN, ...
 load_settings(secrets_dir="/run/secrets")
@@ -261,16 +265,16 @@ Some environment variables steer loading itself (they may also be in `.env`):
 
 | Variable | Meaning |
 | --- | --- |
-| `INFLUXKIT_CONFIG` | The TOML file (default `./influxkit.toml` if it exists) |
-| `INFLUXKIT_SECTION` | A table in it, e.g. `prod` (one file with `[dev...]` and `[prod...]` tables) |
-| `INFLUXKIT_TOKEN_FILE` | Read the token from this file (a mounted secret) |
-| `INFLUXKIT_SECRETS_DIR` | The secrets directory |
+| `SLUICEBOX_CONFIG` | The TOML file (default `./sluicebox.toml` if it exists) |
+| `SLUICEBOX_SECTION` | A table in it, e.g. `prod` (one file with `[dev...]` and `[prod...]` tables) |
+| `SLUICEBOX_TOKEN_FILE` | Read the token from this file (a mounted secret) |
+| `SLUICEBOX_SECRETS_DIR` | The secrets directory |
 
-The token is a `pydantic.SecretStr`: never printed, logged or put in a repr. influxkit refuses to
+The token is a `pydantic.SecretStr`: never printed, logged or put in a repr. sluicebox refuses to
 load a TOML file that contains a token (in any table) or a proxy password, since that file is
 meant to be committed. Unknown keys in the TOML file, keyword overrides or prefixed `.env`
-entries are errors with a "did you mean" suggestion; unknown `INFLUXKIT_*` environment variables
-are logged with the setting they probably meant (`INFLUXKIT_DATABASE` -> `INFLUXKIT_CONNECTION__DATABASE`);
+entries are errors with a "did you mean" suggestion; unknown `SLUICEBOX_*` environment variables
+are logged with the setting they probably meant (`SLUICEBOX_DATABASE` -> `SLUICEBOX_CONNECTION__DATABASE`);
 other applications' `.env` entries are ignored. Invalid settings raise `ConfigurationError`
 listing every problem. Without a token, a 401 error says where the token was looked for.
 
@@ -337,7 +341,7 @@ variable given as a plain name must be set; with `{ var, default }` it is option
 default leaves the tag out).
 
 ```python
-from influxkit import tag_context
+from sluicebox import tag_context
 
 with tag_context(tenant=req.tenant, region=req.region):  # per thread / asyncio task
     client.write(points)
@@ -382,7 +386,7 @@ language fails with a hint saying so.
 
 ## Errors
 
-All exceptions derive from `InfluxKitError`:
+All exceptions derive from `SluiceboxError`:
 
 | Exception | Meaning |
 | --- | --- |
@@ -402,7 +406,7 @@ every point carries an explicit timestamp: a re-sent point overwrites itself.
 
 ## Observability
 
-**Metrics** (Prometheus, namespace `influxkit`, label `client` = settings `name`):
+**Metrics** (Prometheus, namespace `sluicebox`, label `client` = settings `name`):
 `points_written_total`, `points_failed_total`, `points_dropped_total{reason}`,
 `write_batches_total{outcome}`, `write_bytes_total{kind=raw|sent}`, `write_retries_total{reason}`,
 `write_request_duration_seconds`, `write_batch_duration_seconds`, `write_batch_points`,
@@ -413,19 +417,19 @@ every point carries an explicit timestamp: a re-sent point overwrites itself.
 start. Pass `registry=` to use your own registry; set `[metrics] port` to serve `/metrics`
 directly (one port per process). Clients with the same name share series.
 
-Alerts worth having: `increase(influxkit_points_failed_total[5m]) > 0`,
-`increase(influxkit_points_dropped_total[5m]) > 0`,
-`influxkit_write_buffer_bytes / influxkit_write_buffer_limit_bytes > 0.8`,
-`time() - influxkit_write_last_success_timestamp_seconds > 300`, and a rising
-`influxkit_write_retries_total`.
+Alerts worth having: `increase(sluicebox_points_failed_total[5m]) > 0`,
+`increase(sluicebox_points_dropped_total[5m]) > 0`,
+`sluicebox_write_buffer_bytes / sluicebox_write_buffer_limit_bytes > 0.8`,
+`time() - sluicebox_write_last_success_timestamp_seconds > 300`, and a rising
+`sluicebox_write_retries_total`.
 
-**Logging** goes to the `influxkit` logger hierarchy (`influxkit.write`, `.query`, `.validation`,
+**Logging** goes to the `sluicebox` logger hierarchy (`sluicebox.write`, `.query`, `.validation`,
 `.transport`, `.client`, `.config`); the library only adds a `NullHandler`, so records reach your
 own handlers. Records carry structured context (`client`, `database`, `points`, `error`,
 `status`, `code`, `measurement`, `key`) in `record.influx`, which `JsonFormatter` emits as JSON
 keys along with any `extra=` fields. For applications without logging setup,
 `configure_logging(level="INFO", format="json")` or `[logging] configure = true` installs a stderr
-handler on the `influxkit` logger (which then stops propagating). Repeated warnings are rate
+handler on the `sluicebox` logger (which then stops propagating). Repeated warnings are rate
 limited, and `close()` reports how many were suppressed. Tokens never reach log records. Data
 lost at interpreter exit is also printed to stderr when no logging is configured.
 
@@ -461,7 +465,7 @@ print(report.summary(limit=15))  # top functions, wall time, peak memory
   `multiprocessing` with `fork`, create clients after the fork (e.g. in `post_fork`); a client
   inherited across `fork()` keeps working in the child, but data buffered before the fork belongs
   to the parent, and InfluxDB 3 queries (gRPC) cannot run in a child forked after the parent
-  created a query client (influxkit raises instead of hanging). For metrics from several
+  created a query client (sluicebox raises instead of hanging). For metrics from several
   processes, use prometheus_client's multiprocess mode or a port per process.
 
 ## Performance and tuning
@@ -473,9 +477,9 @@ reproduces them.
 
 | 1,000,000 points | InfluxDB 3 Core | InfluxDB 2 |
 | --- | --- | --- |
-| influxkit, `write(list of dicts)` | 272 k points/s | 440 k points/s |
-| influxkit, `write(polars DataFrame)` | 226 k points/s | 562 k points/s |
-| influxkit, one `write()` per point | 211 k points/s | 217 k points/s |
+| sluicebox, `write(list of dicts)` | 272 k points/s | 440 k points/s |
+| sluicebox, `write(polars DataFrame)` | 226 k points/s | 562 k points/s |
+| sluicebox, one `write()` per point | 211 k points/s | 217 k points/s |
 | official client, batching mode | 5 k points/s | 93 k points/s |
 | official client, synchronous 5k-point writes | 5 k points/s | 84 k points/s |
 
@@ -524,7 +528,7 @@ tested through an nginx that requires client certificates), `verify_ssl = false`
 verification (logged once). Python 3.13+ verifies certificates strictly (`VERIFY_X509_STRICT`):
 an internal CA certificate needs `basicConstraints` and `keyUsage` extensions. Proxies:
 `connection.proxy`, with credentials only via the environment
-(`INFLUXKIT_CONNECTION__PROXY=http://user:pass@proxy:3128`); InfluxDB 3 queries tunnel through it.
+(`SLUICEBOX_CONNECTION__PROXY=http://user:pass@proxy:3128`); InfluxDB 3 queries tunnel through it.
 
 InfluxDB 3 Cloud Serverless, Dedicated and Clustered only offer the v2-compatible endpoint: set
 `write.api = "v2"` (a 404 from `/api/v3/write_lp` says so in the error).
@@ -535,7 +539,7 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
 
 - An InfluxDB 2 server answers the InfluxDB 3 write endpoint with its web UI and HTTP 200: a web
   page is never taken for a successful write, and `check()` names the version mismatch.
-- Backslashes: InfluxDB 3 unescapes `\\` in names and tags, InfluxDB 2 does not. influxkit
+- Backslashes: InfluxDB 3 unescapes `\\` in names and tags, InfluxDB 2 does not. sluicebox
   escapes per version, so values like `c:\dir` round-trip on both.
 - InfluxDB 2 silently drops points whose measurement starts with `#` (a comment line), and
   stores but can never query measurement names containing `=`. Both are rejected client-side.
@@ -544,7 +548,7 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
   rest of the batch with them.
 - On InfluxDB 3, `/api/v3/write_lp` (the default for version 3) keeps the valid lines of a batch
   and names the rejected ones; `/api/v2/write` rejects the whole batch.
-- Flux parameters (`params.x`) are a Cloud-only feature; influxkit binds them so they work on OSS.
+- Flux parameters (`params.x`) are a Cloud-only feature; sluicebox binds them so they work on OSS.
 
 ## Development
 

@@ -1,9 +1,9 @@
 """Queries, delegated to the official clients.
 
-* InfluxDB 3: SQL or InfluxQL over Arrow Flight via ``influxdb3-python`` (``pip install
-  influxkit[v3]``). Results stay columnar (Arrow) end to end, which is by far the fastest
-  way to read large result sets.
-* InfluxDB 2: Flux via ``influxdb-client`` (``pip install influxkit[v2]``).
+* InfluxDB 3: SQL or InfluxQL over Arrow Flight via ``influxdb3-python`` (the ``v3``
+  extra). Results stay columnar (Arrow) end to end, which is by far the fastest way to
+  read large result sets.
+* InfluxDB 2: Flux via ``influxdb-client`` (the ``v2`` extra).
 
 Both return :class:`QueryResult`, convertible to Arrow, polars, pandas or plain dicts.
 """
@@ -23,11 +23,11 @@ from .exceptions import (
     AuthenticationError,
     ConfigurationError,
     InfluxConnectionError,
-    InfluxKitError,
     InfluxTimeoutError,
     PermissionDeniedError,
     QueryError,
     ServerError,
+    SluiceboxError,
 )
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 __all__ = ["QueryResult"]
 
-log = logging.getLogger("influxkit.query")
+log = logging.getLogger("sluicebox.query")
 
 Language = Literal["sql", "influxql", "flux"]
 
@@ -124,14 +124,18 @@ class QueryResult:
         return f"<QueryResult rows={self.num_rows} columns={self.columns[:8]} {self.duration * 1000:.1f} ms>"
 
 
+_SOURCE = "git+https://github.com/davidson-engineering/sluicebox"
+
+
+def _install_hint(extra: str) -> str:
+    return f"install sluicebox with the '{extra}' extra (uv add 'sluicebox[{extra}] @ {_SOURCE}')"
+
+
 def _require(module: str, extra: str) -> Any:
     try:
         return __import__(module)
     except ImportError:
-        raise ConfigurationError(
-            f"{module} is required for this operation: install the '{extra}' extra "
-            f"(uv add 'influxkit[{extra}]' or pip install 'influxkit[{extra}]')"
-        ) from None
+        raise ConfigurationError(f"{module} is required for this operation: {_install_hint(extra)}") from None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -151,8 +155,7 @@ class V3QueryBackend:
             from influxdb_client_3 import InfluxDBClient3
         except ImportError:
             raise ConfigurationError(
-                "querying InfluxDB 3 needs the official client: install the 'v3' extra "
-                "(uv add 'influxkit[v3]' or pip install 'influxkit[v3]')"
+                f"querying InfluxDB 3 needs the official client: {_install_hint('v3')}"
             ) from None
         self.pid = os.getpid()
         if _flight_pid is not None and _flight_pid != self.pid:
@@ -217,7 +220,7 @@ class V3QueryBackend:
             reader = self._client.query(query, language=language, mode="reader", database=database, **kwargs)
             for batch in reader:
                 yield _utc_timestamps(pa.Table.from_batches([batch]))
-        except InfluxKitError:
+        except SluiceboxError:
             raise
         except Exception as exc:
             raise _map_v3_error(exc, query) from exc
@@ -253,7 +256,7 @@ def _utc_timestamps(table: pa.Table) -> pa.Table:
     return table
 
 
-def _map_v3_error(exc: BaseException, query: str) -> InfluxKitError:
+def _map_v3_error(exc: BaseException, query: str) -> SluiceboxError:
     """Translate Arrow Flight errors (possibly wrapped by influxdb3-python)."""
     try:
         from pyarrow import flight
@@ -306,8 +309,7 @@ class V2QueryBackend:
             from influxdb_client import InfluxDBClient
         except ImportError:
             raise ConfigurationError(
-                "querying InfluxDB 2 needs the official client: install the 'v2' extra "
-                "(uv add 'influxkit[v2]' or pip install 'influxkit[v2]')"
+                f"querying InfluxDB 2 needs the official client: {_install_hint('v2')}"
             ) from None
         self.pid = os.getpid()
         conn = settings.connection
@@ -338,7 +340,7 @@ class V2QueryBackend:
         try:
             for record in self._api.query_stream(query, org=self._org):
                 yield record.values
-        except InfluxKitError:
+        except SluiceboxError:
             raise
         except Exception as exc:
             raise _map_v2_error(exc, query) from exc
@@ -400,7 +402,7 @@ def _flux_literal(value: Any) -> str:
     raise ValueError(f"unsupported Flux parameter type {type(value).__name__}")
 
 
-def _map_v2_error(exc: BaseException, query: str) -> InfluxKitError:
+def _map_v2_error(exc: BaseException, query: str) -> SluiceboxError:
     status = getattr(exc, "status", None)
     message = getattr(exc, "message", None) or str(exc)
     if isinstance(message, bytes):

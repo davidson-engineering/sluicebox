@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 __all__ = ["is_dataframe", "to_line_chunks"]
 
-log = logging.getLogger("influxkit.validation")
+log = logging.getLogger("sluicebox.validation")
 
 _INT64_MAX = 2**63 - 1
 _FLOAT_EXACT_INT = 2**53

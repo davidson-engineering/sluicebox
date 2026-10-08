@@ -3,9 +3,9 @@
 Sources, highest priority first:
 
 1. Keyword overrides passed to :func:`load_settings` / ``InfluxSettings(...)``.
-2. Environment variables (``INFLUXKIT_TOKEN``, ``INFLUXKIT_WRITE__BATCH_SIZE``, ...).
-3. A ``.env`` file (``INFLUXKIT_*`` keys).
-4. A secrets directory (one file per field, e.g. ``/run/secrets/influxkit_token``).
+2. Environment variables (``SLUICEBOX_TOKEN``, ``SLUICEBOX_WRITE__BATCH_SIZE``, ...).
+3. A ``.env`` file (``SLUICEBOX_*`` keys).
+4. A secrets directory (one file per field, e.g. ``/run/secrets/sluicebox_token``).
 5. The TOML configuration file.
 6. Defaults.
 
@@ -69,8 +69,8 @@ __all__ = [
     "load_settings",
 ]
 
-DEFAULT_CONFIG_FILE = "influxkit.toml"
-DEFAULT_ENV_PREFIX = "INFLUXKIT_"
+DEFAULT_CONFIG_FILE = "sluicebox.toml"
+DEFAULT_ENV_PREFIX = "SLUICEBOX_"
 #: Variables (after the prefix) that steer load_settings() rather than holding a setting.
 _SPECIAL_ENV = ("config", "section", "secrets_dir", "token_file")
 _SECRET_KEYS = frozenset({"token"})
@@ -125,7 +125,7 @@ class ConnectionConfig(_Model):
         if not re.match(r"^https?://[^/\s]+", value):
             raise ValueError("url must start with http:// or https:// followed by a host")
         # A path is kept as a prefix (e.g. behind a path-routing proxy), except an API path
-        # pasted by mistake: influxkit adds /api/v2/... and /api/v3/... itself.
+        # pasted by mistake: sluicebox adds /api/v2/... and /api/v3/... itself.
         return re.sub(r"/api/v[23]$", "", value)
 
     @model_validator(mode="after")
@@ -486,7 +486,7 @@ class MetricsConfig(_Model):
     """Prometheus metrics."""
 
     enabled: bool = True
-    namespace: str = Field(default="influxkit", pattern=r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
+    namespace: str = Field(default="sluicebox", pattern=r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
     port: int | None = Field(
         default=None,
         ge=0,
@@ -507,9 +507,9 @@ class ProfilingConfig(_Model):
 
 
 class LoggingConfig(_Model):
-    """Logging. influxkit logs under the ``influxkit`` logger and installs handlers only when asked."""
+    """Logging. sluicebox logs under the ``sluicebox`` logger and installs handlers only when asked."""
 
-    configure: bool = Field(default=False, description="Install a handler on the 'influxkit' logger.")
+    configure: bool = Field(default=False, description="Install a handler on the 'sluicebox' logger.")
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     format: Literal["text", "json"] = "text"
     log_rejected_lines: int = Field(
@@ -521,8 +521,8 @@ class LoggingConfig(_Model):
 # Root settings
 # ---------------------------------------------------------------------------------------------
 
-_config_log = logging.getLogger("influxkit.config")
-_TOML_DATA: ContextVar[Mapping[str, Any] | None] = ContextVar("influxkit_toml_data", default=None)
+_config_log = logging.getLogger("sluicebox.config")
+_TOML_DATA: ContextVar[Mapping[str, Any] | None] = ContextVar("sluicebox_toml_data", default=None)
 
 
 class _MappingSource(PydanticBaseSettingsSource):
@@ -544,7 +544,7 @@ class _PrefixedDotEnvSource(PydanticBaseSettingsSource):
 
     pydantic-settings reports every unused ``.env`` key as an extra input when
     ``extra="forbid"``. Only keys carrying our prefix are ours to validate, so unknown
-    prefixed keys (typos such as ``INFLUXKIT_TOKN``) still fail loudly.
+    prefixed keys (typos such as ``SLUICEBOX_TOKN``) still fail loudly.
     """
 
     def __init__(self, inner: PydanticBaseSettingsSource) -> None:
@@ -584,7 +584,7 @@ class SettingsOrigin:
 
 
 class InfluxSettings(BaseSettings):
-    """Complete influxkit configuration. Prefer :func:`load_settings` to build one."""
+    """Complete sluicebox configuration. Prefer :func:`load_settings` to build one."""
 
     model_config = SettingsConfigDict(
         env_prefix=DEFAULT_ENV_PREFIX,
@@ -600,7 +600,7 @@ class InfluxSettings(BaseSettings):
         default="default", min_length=1, description="Client name used in metric labels and logs."
     )
     token: SecretStr | None = Field(
-        default=None, description="API token. Secret: set INFLUXKIT_TOKEN in the environment or .env file."
+        default=None, description="API token. Secret: set SLUICEBOX_TOKEN in the environment or .env file."
     )
     connection: ConnectionConfig
     write: WriteConfig = WriteConfig()
@@ -649,7 +649,7 @@ class InfluxSettings(BaseSettings):
             settings = InfluxSettings(_env_file=None, **merged)  # type: ignore[call-arg]
         except PydanticValidationError as exc:
             raise ConfigurationError(
-                f"invalid influxkit settings (keyword arguments):\n{_format_errors(exc, self._origin, None)}"
+                f"invalid sluicebox settings (keyword arguments):\n{_format_errors(exc, self._origin, None)}"
             ) from None
         settings._origin = self._origin
         return settings
@@ -764,7 +764,7 @@ def load_settings(
     """Load settings from a TOML file, the environment, a ``.env`` file and keyword overrides.
 
     Args:
-        config_file: TOML file. Defaults to ``$INFLUXKIT_CONFIG``, else ``./influxkit.toml`` if it
+        config_file: TOML file. Defaults to ``$SLUICEBOX_CONFIG``, else ``./sluicebox.toml`` if it
             exists, else no file (environment only).
         section: Dotted path of a sub-table when the settings live inside a larger application
             config, e.g. ``"services.influx"``.
@@ -813,7 +813,7 @@ def load_settings(
         sources.append("keyword arguments")
         listed = ", ".join(sources)
         raise ConfigurationError(
-            f"invalid influxkit settings (from {listed}):\n{_format_errors(exc, origin, section)}"
+            f"invalid sluicebox settings (from {listed}):\n{_format_errors(exc, origin, section)}"
         ) from None
     finally:
         _TOML_DATA.reset(reset)
@@ -878,7 +878,7 @@ def _warn_unknown_env(env_prefix: str) -> None:
             continue  # a setting, or inside a known table (where unknown keys are errors)
         suggestion = _env_suggestion(path, env_prefix)
         _config_log.warning(
-            "environment variable %s is not an influxkit setting and is ignored%s",
+            "environment variable %s is not an sluicebox setting and is ignored%s",
             variable,
             f" (did you mean {suggestion}?)" if suggestion else "",
         )
@@ -912,7 +912,7 @@ def _setting_paths(model: Any = None, prefix: tuple[str, ...] = ()) -> list[tupl
 
 def _env_suggestion(path: tuple[str, ...], env_prefix: str) -> str | None:
     candidates = {"__".join(leaf): leaf for leaf in _setting_paths()}
-    # INFLUXKIT_DATABASE -> INFLUXKIT_CONNECTION__DATABASE: same last part, different table.
+    # SLUICEBOX_DATABASE -> SLUICEBOX_CONNECTION__DATABASE: same last part, different table.
     same_leaf = [key for key, leaf in candidates.items() if leaf[-1] == path[-1]]
     matches = same_leaf or difflib.get_close_matches("__".join(path), list(candidates), n=1, cutoff=0.7)
     return f"{env_prefix}{matches[0].upper()}" if matches else None

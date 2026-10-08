@@ -1,4 +1,4 @@
-"""Serialization throughput: influxkit vs the official InfluxDB clients.
+"""Serialization throughput: sluicebox vs the official InfluxDB clients.
 
 Run: uv run python benchmarks/bench_serialize.py [--points N]
 """
@@ -10,11 +10,11 @@ import gc
 import time
 from typing import TYPE_CHECKING, Any
 
-from influxkit._lineprotocol import Dialect
-from influxkit._serializer import Serializer
-from influxkit.config import TagsConfig, ValidationConfig
-from influxkit.point import Point
-from influxkit.tags import TagInjector
+from sluicebox._lineprotocol import Dialect
+from sluicebox._serializer import Serializer
+from sluicebox.config import TagsConfig, ValidationConfig
+from sluicebox.point import Point
+from sluicebox.tags import TagInjector
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -66,12 +66,12 @@ def main() -> None:
     print(f"{n:,} points, 3 tags + 3 fields each\n")
     ours = serializer()
     rate = bench(
-        "influxkit dicts (type lock on)", n, lambda: ours.serialize(dicts, database="db", precision="ns")
+        "sluicebox dicts (type lock on)", n, lambda: ours.serialize(dicts, database="db", precision="ns")
     )
-    bench("influxkit Points (type lock on)", n, lambda: ours.serialize(points, database="db", precision="ns"))
+    bench("sluicebox Points (type lock on)", n, lambda: ours.serialize(points, database="db", precision="ns"))
     no_lock = serializer(type_lock=False)
     bench(
-        "influxkit dicts (type lock off)", n, lambda: no_lock.serialize(dicts, database="db", precision="ns")
+        "sluicebox dicts (type lock off)", n, lambda: no_lock.serialize(dicts, database="db", precision="ns")
     )
     tagged = Serializer(
         dialect=Dialect.for_version(3),
@@ -81,7 +81,7 @@ def main() -> None:
         auto_timestamp=True,
     )
     bench(
-        "influxkit dicts + 2 static tags", n, lambda: tagged.serialize(dicts, database="db", precision="ns")
+        "sluicebox dicts + 2 static tags", n, lambda: tagged.serialize(dicts, database="db", precision="ns")
     )
 
     try:
@@ -95,7 +95,7 @@ def main() -> None:
                 V2Point.from_dict(d).to_line_protocol()
 
         official = bench("influxdb-client Point.from_dict().to_line_protocol()", n, official_v2_dicts)
-        print(f"{'':58s} -> influxkit is {rate / official:.1f}x faster")
+        print(f"{'':58s} -> sluicebox is {rate / official:.1f}x faster")
 
     try:
         from influxdb_client_3 import Point as V3Point
@@ -114,7 +114,7 @@ def main() -> None:
                 p.to_line_protocol()
 
         official3 = bench("influxdb3-python Point builder + to_line_protocol()", n, official_v3_points)
-        print(f"{'':58s} -> influxkit is {rate / official3:.1f}x faster")
+        print(f"{'':58s} -> sluicebox is {rate / official3:.1f}x faster")
 
 
 if __name__ == "__main__":

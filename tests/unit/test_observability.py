@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import (
+from sluicebox import (
     AsyncInfluxClient,
     AuthenticationError,
     InfluxClient,
@@ -23,9 +23,9 @@ from influxkit import (
     configure_logging,
     profile,
 )
-from influxkit.config import LoggingConfig
-from influxkit.log import RateLimitedLog
-from influxkit.query import QueryResult, flux_params
+from sluicebox.config import LoggingConfig
+from sluicebox.log import RateLimitedLog
+from sluicebox.query import QueryResult, flux_params
 
 from .fake_server import FakeInflux, Reply
 
@@ -50,20 +50,20 @@ def sample(registry: CollectorRegistry, name: str, **labels: str) -> float:
 class TestMetrics:
     def test_write_metrics(self, client: InfluxClient, registry: CollectorRegistry) -> None:
         client.write([{"measurement": "m", "fields": {"v": float(i)}} for i in range(5)]).result(timeout=5)
-        assert sample(registry, "influxkit_points_written_total", client="obs", database="db") == 5
+        assert sample(registry, "sluicebox_points_written_total", client="obs", database="db") == 5
         assert (
-            sample(registry, "influxkit_write_batches_total", client="obs", database="db", outcome="success")
+            sample(registry, "sluicebox_write_batches_total", client="obs", database="db", outcome="success")
             == 1
         )
-        assert sample(registry, "influxkit_write_bytes_total", client="obs", database="db", kind="raw") > 0
+        assert sample(registry, "sluicebox_write_bytes_total", client="obs", database="db", kind="raw") > 0
         assert (
-            sample(registry, "influxkit_write_request_duration_seconds_count", client="obs", database="db")
+            sample(registry, "sluicebox_write_request_duration_seconds_count", client="obs", database="db")
             == 1
         )
         assert (
-            sample(registry, "influxkit_stage_duration_seconds_count", client="obs", stage="serialize") == 1
+            sample(registry, "sluicebox_stage_duration_seconds_count", client="obs", stage="serialize") == 1
         )
-        assert sample(registry, "influxkit_write_buffer_bytes", client="obs") == 0
+        assert sample(registry, "sluicebox_write_buffer_bytes", client="obs") == 0
         labels = {
             "client": "obs",
             "version": __version__,
@@ -71,7 +71,7 @@ class TestMetrics:
             "server_version": "3",
             "database": "db",
         }
-        assert registry.get_sample_value("influxkit_client_info", labels) == 1.0
+        assert registry.get_sample_value("sluicebox_client_info", labels) == 1.0
 
     def test_failure_and_drop_metrics(
         self, fake: FakeInflux, make_settings: Callable[..., Any], registry: CollectorRegistry
@@ -83,12 +83,12 @@ class TestMetrics:
                 [{"measurement": "m", "fields": {"v": 1.0}}, {"measurement": "m", "fields": {"v": "x"}}]
             )
             client.flush(timeout=5)
-        assert sample(registry, "influxkit_points_failed_total", client="bad", database="db") == 1
-        assert sample(registry, "influxkit_points_dropped_total", client="bad", reason="type_conflict") == 1
+        assert sample(registry, "sluicebox_points_failed_total", client="bad", database="db") == 1
+        assert sample(registry, "sluicebox_points_dropped_total", client="bad", reason="type_conflict") == 1
         assert (
             sample(
                 registry,
-                "influxkit_errors_total",
+                "sluicebox_errors_total",
                 client="bad",
                 operation="write",
                 error="AuthenticationError",
@@ -105,8 +105,8 @@ class TestMetrics:
         b.write({"measurement": "m", "fields": {"v": 1.0}}).result(timeout=5)
         a.close()
         b.close()
-        assert sample(registry, "influxkit_points_written_total", client="a", database="db") == 1
-        assert sample(registry, "influxkit_points_written_total", client="b", database="db") == 1
+        assert sample(registry, "sluicebox_points_written_total", client="a", database="db") == 1
+        assert sample(registry, "sluicebox_points_written_total", client="b", database="db") == 1
 
     def test_disabled(
         self, fake: FakeInflux, make_settings: Callable[..., Any], registry: CollectorRegistry
@@ -123,7 +123,7 @@ class TestLogging:
         self, fake: FakeInflux, make_settings: Callable[..., Any], caplog: Any
     ) -> None:
         fake.responder = lambda _: Reply(401, {"error": "nope"})
-        caplog.set_level(logging.DEBUG, logger="influxkit")
+        caplog.set_level(logging.DEBUG, logger="sluicebox")
         settings = make_settings(url=fake.url, token="super-secret-token")
         with InfluxClient(settings, registry=CollectorRegistry()) as client:
             with pytest.raises(AuthenticationError):
@@ -137,7 +137,7 @@ class TestLogging:
 
     def test_json_formatter(self) -> None:
         record = logging.LogRecord(
-            "influxkit.write", logging.WARNING, __file__, 1, "hello %s", ("world",), None
+            "sluicebox.write", logging.WARNING, __file__, 1, "hello %s", ("world",), None
         )
         record.influx = {"database": "db", "points": 5}
         payload = json.loads(JsonFormatter().format(record))
@@ -151,9 +151,9 @@ class TestLogging:
         logger = configure_logging(LoggingConfig(configure=True, level="DEBUG", format="json"), stream=stream)
         configure_logging(LoggingConfig(configure=True, level="DEBUG", format="json"), stream=stream)
         try:
-            marked = [h for h in logger.handlers if getattr(h, "_influxkit_handler", False)]
+            marked = [h for h in logger.handlers if getattr(h, "_sluicebox_handler", False)]
             assert len(marked) == 1
-            logging.getLogger("influxkit.test").info("structured")
+            logging.getLogger("sluicebox.test").info("structured")
             assert json.loads(stream.getvalue().splitlines()[-1])["message"] == "structured"
         finally:
             for handler in marked:
@@ -162,8 +162,8 @@ class TestLogging:
             logger.setLevel(logging.NOTSET)
 
     def test_rate_limited_log(self, caplog: Any) -> None:
-        caplog.set_level(logging.WARNING, logger="influxkit.ratelimit")
-        limited = RateLimitedLog(logging.getLogger("influxkit.ratelimit"), interval=0.2)
+        caplog.set_level(logging.WARNING, logger="sluicebox.ratelimit")
+        limited = RateLimitedLog(logging.getLogger("sluicebox.ratelimit"), interval=0.2)
         for _ in range(50):
             limited.log("k", logging.WARNING, "boom")
         assert len(caplog.records) == 1
@@ -176,7 +176,7 @@ class TestLogging:
     def test_invalid_records_are_logged_once(
         self, fake: FakeInflux, make_settings: Callable[..., Any], caplog: Any
     ) -> None:
-        caplog.set_level(logging.WARNING, logger="influxkit.validation")
+        caplog.set_level(logging.WARNING, logger="sluicebox.validation")
         settings = make_settings(url=fake.url, validation={"on_invalid": "drop"})
         with InfluxClient(settings, registry=CollectorRegistry()) as client:
             for _ in range(20):
@@ -312,7 +312,7 @@ class TestQueryHelpers:
 
 class TestUsability:
     def test_json_formatter_includes_extra_and_context(self) -> None:
-        logger = logging.getLogger("influxkit.test.json")
+        logger = logging.getLogger("sluicebox.test.json")
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
         handler.setFormatter(JsonFormatter())
@@ -330,7 +330,7 @@ class TestUsability:
         stream = io.StringIO()
         logger = configure_logging(level="DEBUG", format="json", stream=stream)
         try:
-            logging.getLogger("influxkit.test").debug("hello")
+            logging.getLogger("sluicebox.test").debug("hello")
             assert json.loads(stream.getvalue())["message"] == "hello"
             assert logger.level == logging.DEBUG
         finally:
@@ -342,8 +342,8 @@ class TestUsability:
             logger.setLevel(logging.NOTSET)
 
     def test_rate_limited_log_flush_reports_suppressed(self, caplog: Any) -> None:
-        caplog.set_level(logging.INFO, logger="influxkit.test.rate")
-        limiter = RateLimitedLog(logging.getLogger("influxkit.test.rate"), interval=60)
+        caplog.set_level(logging.INFO, logger="sluicebox.test.rate")
+        limiter = RateLimitedLog(logging.getLogger("sluicebox.test.rate"), interval=60)
         for i in range(5):
             limiter.log("k", logging.INFO, "event %d", i)
         limiter.flush()
@@ -355,7 +355,7 @@ class TestUsability:
     def test_blocking_calls_on_an_event_loop_warn(
         self, fake: FakeInflux, make_settings: Callable[..., Any], caplog: Any
     ) -> None:
-        caplog.set_level(logging.WARNING, logger="influxkit.client")
+        caplog.set_level(logging.WARNING, logger="sluicebox.client")
 
         async def scenario() -> None:
             with InfluxClient(make_settings(url=fake.url), registry=CollectorRegistry()) as client:
@@ -423,7 +423,7 @@ class TestQueryUsability:
         assert result.to_arrow().num_rows == 0
 
     def test_datetime_sql_parameters_are_sent_as_rfc3339(self) -> None:
-        from influxkit.query import _sql_parameter
+        from sluicebox.query import _sql_parameter
 
         moment = datetime(2026, 1, 1, 2, tzinfo=timezone(timedelta(hours=2)))
         assert _sql_parameter(moment) == "2026-01-01T00:00:00Z"
@@ -432,8 +432,8 @@ class TestQueryUsability:
             _sql_parameter(datetime(2026, 1, 1))
 
     def test_query_language_hints(self) -> None:
-        from influxkit.client import _hint_language
-        from influxkit.exceptions import QueryError
+        from sluicebox.client import _hint_language
+        from sluicebox.exceptions import QueryError
 
         flux_on_v3 = QueryError("parse error")
         _hint_language(flux_on_v3, 'from(bucket: "b") |> range(start: -1h)', "sql")
@@ -446,7 +446,7 @@ class TestQueryUsability:
         ("status", "kind"), [(404, "QueryError"), (500, "QueryError"), (503, "ServerError")]
     )
     def test_influxdb2_query_errors(self, status: int, kind: str) -> None:
-        from influxkit.query import _map_v2_error
+        from sluicebox.query import _map_v2_error
 
         class ApiError(Exception):
             def __init__(self) -> None:

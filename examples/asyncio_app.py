@@ -6,7 +6,7 @@ uv run python examples/asyncio_app.py
 import asyncio
 from datetime import UTC, datetime, timedelta
 
-from influxkit import AsyncInfluxClient
+from sluicebox import AsyncInfluxClient
 
 
 async def main() -> None:

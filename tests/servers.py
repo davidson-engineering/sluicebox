@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from influxkit import InfluxClient, load_settings
+from sluicebox import InfluxClient, load_settings
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry
@@ -29,14 +29,14 @@ def _credential(variable: str, file_name: str) -> str:
         return ""
 
 
-V2_URL = os.environ.get("INFLUXKIT_TEST_V2_URL", "http://localhost:18086")
-V2_TOKEN = _credential("INFLUXKIT_TEST_V2_TOKEN", "influxdb2-token")
-V2_ORG = "influxkit"
-V2_BUCKET = "influxkit"
-V3_URL = os.environ.get("INFLUXKIT_TEST_V3_URL", "http://localhost:18181")
-V3_TOKEN = _credential("INFLUXKIT_TEST_V3_TOKEN", "influxdb3-token")
+V2_URL = os.environ.get("SLUICEBOX_TEST_V2_URL", "http://localhost:18086")
+V2_TOKEN = _credential("SLUICEBOX_TEST_V2_TOKEN", "influxdb2-token")
+V2_ORG = "sluicebox"
+V2_BUCKET = "sluicebox"
+V3_URL = os.environ.get("SLUICEBOX_TEST_V3_URL", "http://localhost:18181")
+V3_TOKEN = _credential("SLUICEBOX_TEST_V3_TOKEN", "influxdb3-token")
 # InfluxDB 3 Core allows only 5 databases: integration tests share this one.
-V3_DATABASE = "influxkit_test"
+V3_DATABASE = "sluicebox_test"
 
 
 def deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:

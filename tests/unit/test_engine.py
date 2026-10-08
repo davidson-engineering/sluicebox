@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import (
+from sluicebox import (
     AuthenticationError,
     BadRequestError,
     BufferFullError,
@@ -24,7 +24,7 @@ from influxkit import (
     WriteError,
     WriteFailure,
 )
-from influxkit._engine import _close_all_at_exit
+from sluicebox._engine import _close_all_at_exit
 
 from .fake_server import FakeInflux, Recorded, Reply, sequence
 
@@ -100,7 +100,7 @@ class TestBatching:
         }
         assert request.headers["Authorization"] == "Bearer test-token"
         assert request.headers["Content-Type"] == "text/plain; charset=utf-8"
-        assert request.headers["User-Agent"].startswith("influxkit/")
+        assert request.headers["User-Agent"].startswith("sluicebox/")
 
     def test_request_shape_v2(self, fake: FakeInflux, client_for: Any) -> None:
         client = client_for(version=2)
@@ -430,7 +430,7 @@ class TestProxy:
 class TestConcurrency:
     def test_many_threads_share_one_client(self, fake: FakeInflux, client_for: Any) -> None:
         """Every line arrives exactly once and intact, also on free-threaded Python."""
-        from influxkit import tag_context
+        from sluicebox import tag_context
 
         client = client_for(write={"batch_size": 500, "concurrency": 8, "flush_interval": 0.01})
         threads_count, per_thread = 8, 2_000

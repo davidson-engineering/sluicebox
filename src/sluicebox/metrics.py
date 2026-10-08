@@ -5,7 +5,7 @@ which is distinguished by the ``client`` label - so several clients (or a client
 in tests) never trigger duplicate-registration errors. Instrumentation is per batch or per
 call, never per point, so it costs nothing measurable on the hot path.
 
-Metrics (default namespace ``influxkit``):
+Metrics (default namespace ``sluicebox``):
 
 =====================================================  =========  ===========================
 name                                                    type       labels
@@ -92,7 +92,7 @@ class _Families:
             return Gauge(name, doc, labels, namespace=namespace, registry=registry)
 
         self.info = Info(
-            "client", "influxkit client information", ("client",), namespace=namespace, registry=registry
+            "client", "sluicebox client information", ("client",), namespace=namespace, registry=registry
         )
         self.points_written = counter(
             "points_written", "Points acknowledged by the server", ("client", "database")

@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from influxkit import InfluxClient, WriteFailure, configure_logging, tag_context
+from sluicebox import InfluxClient, WriteFailure, configure_logging, tag_context
 
 DEAD_LETTERS = Path("dead-letters.lp")
 stop = threading.Event()

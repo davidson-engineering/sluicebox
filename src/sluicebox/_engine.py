@@ -9,7 +9,7 @@
   connection pool, retrying transient failures with backoff and splitting batches the
   server rejects as too large (HTTP 413);
 * bounds memory with ``max_pending_bytes`` (block / drop / raise when full);
-* resolves each ``write()`` call's :class:`~influxkit.futures.WriteFuture`, attributing
+* resolves each ``write()`` call's :class:`~sluicebox.futures.WriteFuture`, attributing
   per-line partial-write errors to the exact call (and line) that produced them.
 
 Threads are daemons, started on first use, re-created after ``fork()``, and the buffer is
@@ -45,13 +45,13 @@ from .exceptions import (
     BufferFullError,
     ClientClosedError,
     InfluxConnectionError,
-    InfluxKitError,
     InfluxTimeoutError,
     LineError,
     NotFoundError,
     PartialWriteError,
     PayloadTooLargeError,
     ServerError,
+    SluiceboxError,
     TransportError,
     WriteError,
 )
@@ -67,7 +67,7 @@ if TYPE_CHECKING:
 
 __all__ = ["EngineStats", "WriteEngine", "WriteFailure"]
 
-log = logging.getLogger("influxkit.write")
+log = logging.getLogger("sluicebox.write")
 
 _V3_PRECISION = {"ns": "nanosecond", "us": "microsecond", "ms": "millisecond", "s": "second"}
 _MAX_RECORDED_FAILURES = 100
@@ -577,12 +577,12 @@ class WriteEngine:
     def _start_threads(self) -> None:
         for index in range(self._concurrency):
             thread = threading.Thread(
-                target=self._sender_loop, name=f"influxkit-{self.name}-sender-{index}", daemon=True
+                target=self._sender_loop, name=f"sluicebox-{self.name}-sender-{index}", daemon=True
             )
             thread.start()
             self._threads.append(thread)
         flusher = threading.Thread(
-            target=self._flusher_loop, name=f"influxkit-{self.name}-flusher", daemon=True
+            target=self._flusher_loop, name=f"sluicebox-{self.name}-flusher", daemon=True
         )
         flusher.start()
         self._threads.append(flusher)
@@ -685,7 +685,7 @@ class WriteEngine:
                 outcome.failures.append(
                     _Failure(base, base + len(lines), exc, failed=min(rejected, len(lines)))
                 )
-        except InfluxKitError as exc:
+        except SluiceboxError as exc:
             outcome.failures.append(_Failure(base, base + len(lines), exc))
 
     def _post(self, batch: _Batch, payload: bytes, outcome: _Outcome) -> None:
@@ -703,7 +703,7 @@ class WriteEngine:
         while True:
             attempt += 1
             started = time.perf_counter()
-            error: InfluxKitError
+            error: SluiceboxError
             try:
                 response = self._transport.request(
                     "POST", path, params=params, body=body, headers=headers, timeout=self._request_timeout
@@ -1114,9 +1114,9 @@ def _close_all_at_exit() -> None:
                 log.error("at exit: %s", failure)
                 if not _has_handlers(log):
                     # Data was lost and nothing would say so: the library only installs a NullHandler.
-                    print(f"influxkit: at exit: {failure}", file=sys.stderr)
+                    print(f"sluicebox: at exit: {failure}", file=sys.stderr)
         except Exception:
-            log.exception("failed to flush influxkit write buffer at exit")
+            log.exception("failed to flush sluicebox write buffer at exit")
 
 
 def _has_handlers(logger: logging.Logger) -> bool:

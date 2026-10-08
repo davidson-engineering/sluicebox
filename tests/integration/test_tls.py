@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import InfluxClient, InfluxConnectionError, InfluxKitError, ServerError, load_settings
+from sluicebox import InfluxClient, InfluxConnectionError, ServerError, SluiceboxError, load_settings
 from tests.servers import V2_BUCKET, V2_ORG, V2_TOKEN, V3_DATABASE, V3_TOKEN, reachable
 
 pytestmark = pytest.mark.integration
@@ -92,7 +92,7 @@ def test_untrusted_certificate_fails_fast_without_retries(
         client.write(records(unique, 1)).result(timeout=30)
     assert time.monotonic() - started < 5
     assert client.stats().write.retries == 0  # a TLS failure will not fix itself
-    with pytest.raises(InfluxKitError):
+    with pytest.raises(SluiceboxError):
         client.query("SELECT 1" if server_version == 3 else "buckets()")
     client.close()  # the failure was already raised by result(): not reported twice
 

@@ -6,7 +6,7 @@ code only needs non-blocking entry points. Nothing here blocks the event loop:
 
 * ``fut = await client.write(points)`` buffers the data (serializing large inputs in a
   worker thread and waiting for buffer space off-loop) and returns a
-  :class:`~influxkit.futures.WriteFuture`; ``await fut`` waits for acknowledgement.
+  :class:`~sluicebox.futures.WriteFuture`; ``await fut`` waits for acknowledgement.
 * ``query``, ``flush``, ``ping``, ``sync_schema`` and ``close`` run in worker threads.
 * ``query_stream`` is an async iterator.
 """
@@ -45,7 +45,7 @@ _YIELD_EVERY = 32
 
 
 class AsyncInfluxClient:
-    """asyncio-friendly client; see :class:`~influxkit.client.InfluxClient` for the arguments."""
+    """asyncio-friendly client; see :class:`~sluicebox.client.InfluxClient` for the arguments."""
 
     def __init__(
         self,
@@ -69,7 +69,7 @@ class AsyncInfluxClient:
         *,
         section: str | None = None,
         env_file: str | os.PathLike[str] | None = ".env",
-        env_prefix: str = "INFLUXKIT_",
+        env_prefix: str = "SLUICEBOX_",
         secrets_dir: str | os.PathLike[str] | None = None,
         tags: Mapping[str, str] | None = None,
         enrichers: Sequence[Enricher] = (),
@@ -257,7 +257,7 @@ def _is_large(data: Any, chunk_size: int) -> bool:
     """Whether serializing ``data`` could hold the event loop for more than a few milliseconds."""
     if isinstance(data, str | bytes):
         return len(data) > 100_000
-    if isinstance(data, Mapping | Point) or hasattr(type(data), "__influxkit_model__"):
+    if isinstance(data, Mapping | Point) or hasattr(type(data), "__sluicebox_model__"):
         return False
     if isinstance(data, list | tuple):
         return len(data) > 1_000

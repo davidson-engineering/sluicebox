@@ -9,15 +9,15 @@ from typing import Any
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import InfluxClient, InfluxSettings, WriteError, load_settings
+from sluicebox import InfluxClient, InfluxSettings, WriteError, load_settings
 from tests.servers import deep_merge, server_client
 
 
 @pytest.fixture(autouse=True)
 def _isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
-    """No developer INFLUXKIT_* variables, .env or influxkit.toml can leak into a test."""
+    """No developer SLUICEBOX_* variables, .env or sluicebox.toml can leak into a test."""
     for name in list(os.environ):
-        if name.startswith("INFLUXKIT_") and not name.startswith("INFLUXKIT_TEST_"):
+        if name.startswith("SLUICEBOX_") and not name.startswith("SLUICEBOX_TEST_"):
             monkeypatch.delenv(name)
     monkeypatch.chdir(tmp_path)
 

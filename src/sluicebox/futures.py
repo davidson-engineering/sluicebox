@@ -31,7 +31,7 @@ __all__ = ["WriteFuture", "WriteResult"]
 #: Validation errors kept per write() call (``dropped`` always has the exact count).
 MAX_REJECTED = 1000
 
-log = logging.getLogger("influxkit.write")
+log = logging.getLogger("sluicebox.write")
 
 # One lock for all futures: state transitions are tiny and rare relative to serialization.
 # The write engine holds it across fork() (see ``_engine``), so the child inherits it unlocked.
@@ -266,7 +266,7 @@ class WriteFuture:
         )
 
 
-_loop_warnings = RateLimitedLog(logging.getLogger("influxkit.client"), interval=60.0)
+_loop_warnings = RateLimitedLog(logging.getLogger("sluicebox.client"), interval=60.0)
 
 
 def warn_if_event_loop(call: str, instead: str) -> None:

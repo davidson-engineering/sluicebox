@@ -18,7 +18,7 @@ import polars as pl
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import (
+from sluicebox import (
     AsyncInfluxClient,
     AuthenticationError,
     ConfigurationError,
@@ -34,8 +34,8 @@ from influxkit import (
     load_settings,
     measurement,
 )
-from influxkit.client import flux_string
-from influxkit.types import FieldType
+from sluicebox.client import flux_string
+from sluicebox.types import FieldType
 from tests.servers import V2_BUCKET, V2_ORG, V2_TOKEN, V2_URL, V3_DATABASE, V3_TOKEN, V3_URL
 
 pytestmark = pytest.mark.integration
@@ -139,7 +139,7 @@ def test_special_measurement_and_keys(live_client: InfluxClient, unique: str) ->
 
 
 def test_all_field_types(live_client: InfluxClient, unique: str) -> None:
-    from influxkit import UInt
+    from sluicebox import UInt
 
     live_client.write(
         Point(unique)
@@ -514,7 +514,7 @@ def test_exit_without_close_delivers_the_data(server_version: int, unique: str) 
     if server_version == 3:
         del connection["org"]
     script = (
-        "from influxkit import InfluxClient, load_settings\n"
+        "from sluicebox import InfluxClient, load_settings\n"
         f"settings = load_settings(None, env_file=None, token={token!r}, connection={connection!r})\n"
         "client = InfluxClient(settings)\n"
         f"client.write([{{'measurement': {unique!r}, 'fields': {{'v': float(i)}}, 'time': {T0_NS} + i * 1000}}"

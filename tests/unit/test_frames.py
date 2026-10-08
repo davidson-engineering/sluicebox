@@ -9,12 +9,12 @@ import pandas as pd
 import polars as pl
 import pytest
 
-from influxkit import Point, ValidationError
-from influxkit._lineprotocol import Dialect, parse_line
-from influxkit._serializer import Serializer
-from influxkit.config import MeasurementSchema, TagRule, TagsConfig, ValidationConfig
-from influxkit.frames import to_line_chunks
-from influxkit.tags import TagInjector, tag_context
+from sluicebox import Point, ValidationError
+from sluicebox._lineprotocol import Dialect, parse_line
+from sluicebox._serializer import Serializer
+from sluicebox.config import MeasurementSchema, TagRule, TagsConfig, ValidationConfig
+from sluicebox.frames import to_line_chunks
+from sluicebox.tags import TagInjector, tag_context
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -247,7 +247,7 @@ def test_pandas_without_polars_uses_row_path(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_column_errors() -> None:
-    from influxkit import ConfigurationError
+    from sluicebox import ConfigurationError
 
     frame = pl.DataFrame({"a": [1.0], "b": ["x"]})
     with pytest.raises(ConfigurationError, match="no columns"):
@@ -383,7 +383,7 @@ class TestUsability:
         assert info.value.code == "naive_datetime"
 
     def test_integer_times_are_range_checked(self, caplog: Any) -> None:
-        caplog.set_level("WARNING", logger="influxkit.validation")
+        caplog.set_level("WARNING", logger="sluicebox.validation")
         seconds = pl.DataFrame({"time": [1_704_067_200], "v": [1.0]})
         frame_lines(make(), seconds)  # ns precision: lands in 1970, so warn
         assert "precision='s'" in caplog.text

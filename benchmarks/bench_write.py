@@ -1,9 +1,9 @@
-"""End-to-end write throughput: influxkit vs the official clients, against real servers.
+"""End-to-end write throughput: sluicebox vs the official clients, against real servers.
 
 Start the servers first (``docker compose up -d --wait``), then e.g.::
 
     uv run python benchmarks/bench_write.py --server 3 --points 500000
-    uv run python benchmarks/bench_write.py --server 2 --points 500000 --only influxkit
+    uv run python benchmarks/bench_write.py --server 2 --points 500000 --only sluicebox
     uv run python benchmarks/bench_write.py --server 3 --tune     # batch size / concurrency / gzip sweep
 
 Every scenario writes the same points to a fresh measurement and verifies the stored count,
@@ -22,8 +22,8 @@ from typing import TYPE_CHECKING, Any
 
 from prometheus_client import CollectorRegistry
 
-from influxkit import InfluxClient, load_settings
-from influxkit.client import flux_string
+from sluicebox import InfluxClient, load_settings
+from sluicebox.client import flux_string
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,13 +45,13 @@ SERVERS = {
     2: {
         "url": "http://localhost:18086",
         "token_file": "influxdb2-token",
-        "database": "influxkit",
-        "org": "influxkit",
+        "database": "sluicebox",
+        "org": "sluicebox",
     },
     3: {
         "url": "http://localhost:18181",
         "token_file": "influxdb3-token",
-        "database": "influxkit_bench",
+        "database": "sluicebox_bench",
     },
 }
 BASE_NS = 1_767_225_600_000_000_000  # 2026-01-01
@@ -139,7 +139,7 @@ def run(name: str, n: int, body: Callable[[str], float], verifier: InfluxClient)
     return outcome
 
 
-def influxkit_records(version: int, n: int, **overrides: Any) -> Callable[[str], float]:
+def sluicebox_records(version: int, n: int, **overrides: Any) -> Callable[[str], float]:
     def body(measurement: str) -> float:
         points = make_points(n, measurement)
         with InfluxClient(settings_for(version, **overrides), registry=CollectorRegistry()) as client:
@@ -152,7 +152,7 @@ def influxkit_records(version: int, n: int, **overrides: Any) -> Callable[[str],
     return body
 
 
-def influxkit_frame(version: int, n: int) -> Callable[[str], float]:
+def sluicebox_frame(version: int, n: int) -> Callable[[str], float]:
     import polars as pl
 
     def body(measurement: str) -> float:
@@ -179,7 +179,7 @@ def influxkit_frame(version: int, n: int) -> Callable[[str], float]:
     return body
 
 
-def influxkit_single_points(version: int, n: int) -> Callable[[str], float]:
+def sluicebox_single_points(version: int, n: int) -> Callable[[str], float]:
     """An application emitting one point per write() call (the fire-and-forget pattern)."""
 
     def body(measurement: str) -> float:
@@ -258,7 +258,7 @@ def main() -> None:
     )
     parser.add_argument("--server", type=int, choices=[2, 3], default=3)
     parser.add_argument("--points", type=int, default=300_000)
-    parser.add_argument("--only", choices=["influxkit", "official"], default=None)
+    parser.add_argument("--only", choices=["sluicebox", "official"], default=None)
     parser.add_argument("--tune", action="store_true", help="sweep batch size, concurrency and gzip")
     args = parser.parse_args()
     n = args.points
@@ -272,9 +272,9 @@ def main() -> None:
             for batch_size in (5_000, 10_000, 25_000):
                 for concurrency in (1, 2, 4, 8):
                     run(
-                        f"influxkit batch={batch_size:,} concurrency={concurrency} gzip={gzip}",
+                        f"sluicebox batch={batch_size:,} concurrency={concurrency} gzip={gzip}",
                         n,
-                        influxkit_records(
+                        sluicebox_records(
                             version,
                             n,
                             write={"batch_size": batch_size, "concurrency": concurrency, "gzip": gzip},
@@ -283,10 +283,10 @@ def main() -> None:
                     )
         return
 
-    if args.only in (None, "influxkit"):
-        run("influxkit: write(list of dicts)", n, influxkit_records(version, n), verifier)
-        run("influxkit: write(polars DataFrame)", n, influxkit_frame(version, n), verifier)
-        run("influxkit: one write() per point", n, influxkit_single_points(version, n), verifier)
+    if args.only in (None, "sluicebox"):
+        run("sluicebox: write(list of dicts)", n, sluicebox_records(version, n), verifier)
+        run("sluicebox: write(polars DataFrame)", n, sluicebox_frame(version, n), verifier)
+        run("sluicebox: one write() per point", n, sluicebox_single_points(version, n), verifier)
     if args.only in (None, "official"):
         if version == 2:
             run("influxdb-client: batching mode (Rx), dicts", n, official_v2(n, "batching"), verifier)

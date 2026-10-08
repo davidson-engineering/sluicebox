@@ -1,12 +1,12 @@
 """Write and read back a few points.
 
-Setup: copy influxkit.example.toml to influxkit.toml (adjust [connection]) and put
-INFLUXKIT_TOKEN=... in .env, then run:  uv run python examples/quickstart.py
+Setup: copy sluicebox.example.toml to sluicebox.toml (adjust [connection]) and put
+SLUICEBOX_TOKEN=... in .env, then run:  uv run python examples/quickstart.py
 """
 
 from datetime import UTC, datetime
 
-from influxkit import InfluxClient, Point
+from sluicebox import InfluxClient, Point
 
 with InfluxClient.from_config() as client:
     print("connected to", client.check())  # verifies URL, version, token and database

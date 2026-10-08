@@ -32,7 +32,7 @@ __all__ = ["Enricher", "TagInjector", "current_context_tags", "tag_context"]
 #: ``(measurement, tags, fields) -> tags to add`` (or None for no change).
 Enricher: TypeAlias = Callable[[str, Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any] | None]
 
-_CONTEXT_TAGS: ContextVar[Mapping[str, str] | None] = ContextVar("influxkit_context_tags", default=None)
+_CONTEXT_TAGS: ContextVar[Mapping[str, str] | None] = ContextVar("sluicebox_context_tags", default=None)
 
 
 @contextmanager

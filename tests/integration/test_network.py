@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import InfluxClient, InfluxKitError, WriteError, load_settings
-from influxkit.client import flux_string
+from sluicebox import InfluxClient, SluiceboxError, WriteError, load_settings
+from sluicebox.client import flux_string
 from tests.servers import V2_BUCKET, V2_ORG, V2_TOKEN, V3_DATABASE, V3_TOKEN, reachable, server_client
 
 if TYPE_CHECKING:
@@ -144,7 +144,7 @@ def count(client: InfluxClient, measurement: str) -> int:
         if client.settings.connection.version == 3:
             try:
                 rows = client.query(f'SELECT count(*) AS n FROM "{measurement}"').to_dicts()
-            except InfluxKitError as error:  # table does not exist yet
+            except SluiceboxError as error:  # table does not exist yet
                 if "not found" not in str(error):
                     raise
                 rows = [{"n": 0}]
@@ -287,7 +287,7 @@ def test_truncated_uploads_are_never_partially_ingested(
         write={"gzip": gzip, "gzip_min_bytes": 0, "retry": {"max_attempts": 2, "initial_delay": 0.05}},
         connection={"timeout": 5},
     )
-    with pytest.raises(InfluxKitError):
+    with pytest.raises(SluiceboxError):
         client.write(points(unique, 20_000)).result(timeout=60)
     toxiproxy.reset()
     time.sleep(1.0)

@@ -152,7 +152,7 @@ class Serializer:
         self._fragments: dict[tuple[str, str], str] = {}
         self._last_datetime: tuple[datetime | None, int] = (None, 0)
         self._seeded_models: set[tuple[str, type]] = set()
-        self._warnings = RateLimitedLog(logging.getLogger("influxkit.validation"))
+        self._warnings = RateLimitedLog(logging.getLogger("sluicebox.validation"))
 
     # ------------------------------------------------------------------------------------
     # Public API
@@ -1025,7 +1025,7 @@ class Serializer:
         )
 
     def _unpack_other(self, record: Any, database: str) -> tuple[Any, Any, Any, Any]:
-        spec = getattr(type(record), "__influxkit_model__", None)
+        spec = getattr(type(record), "__sluicebox_model__", None)
         if spec is not None:
             if (database, type(record)) not in self._seeded_models:
                 # A model's annotations declare its field types: lock them before the first write.
@@ -1041,7 +1041,7 @@ class Serializer:
             return record["measurement"], record.get("tags"), record["fields"], record.get("time")
         hint = ""
         if hasattr(record, "__dataclass_fields__") or hasattr(type(record), "model_fields"):
-            hint = "; decorate the class with @influxkit.measurement to write it directly"
+            hint = "; decorate the class with @sluicebox.measurement to write it directly"
         raise ValidationError(
             f"cannot write a {type(record).__name__}: expected Point, dict, line protocol str/bytes "
             f"or a @measurement model{hint}",

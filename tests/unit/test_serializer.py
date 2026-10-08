@@ -12,12 +12,12 @@ import pandas as pd
 import pytest
 from pydantic import BaseModel
 
-from influxkit import Point, Tag, Timestamp, UInt, ValidationError, measurement
-from influxkit._lineprotocol import Dialect
-from influxkit._serializer import Serializer
-from influxkit.config import MeasurementSchema, TagRule, TagsConfig, ValidationConfig
-from influxkit.tags import TagInjector, tag_context
-from influxkit.types import FieldType
+from sluicebox import Point, Tag, Timestamp, UInt, ValidationError, measurement
+from sluicebox._lineprotocol import Dialect
+from sluicebox._serializer import Serializer
+from sluicebox.config import MeasurementSchema, TagRule, TagsConfig, ValidationConfig
+from sluicebox.tags import TagInjector, tag_context
+from sluicebox.types import FieldType
 
 T0 = 1_700_000_000_000_000_000
 
@@ -527,7 +527,7 @@ class TestTagInjection:
     def test_from_env(self) -> None:
         injector = TagInjector(TagsConfig(from_env={"region": "REGION"}), environ={"REGION": "eu-west"})
         assert injector.static == {"region": "eu-west"}
-        from influxkit import ConfigurationError
+        from sluicebox import ConfigurationError
 
         with pytest.raises(ConfigurationError, match="REGION"):
             TagInjector(TagsConfig(from_env={"region": "REGION"}), environ={})
@@ -574,7 +574,7 @@ class TestModels:
 
         err = error_of(make(), Plain(1.0))
         assert err.code == "unsupported_record"
-        assert "@influxkit.measurement" in str(err)
+        assert "@sluicebox.measurement" in str(err)
 
 
 class TestUntimedOverwrites:
@@ -588,14 +588,14 @@ class TestUntimedOverwrites:
         )
 
     def test_warns_when_untimed_points_collide(self, caplog: Any) -> None:
-        caplog.set_level("WARNING", logger="influxkit.validation")
+        caplog.set_level("WARNING", logger="sluicebox.validation")
         self.serializer().serialize(
             [{"measurement": "m", "fields": {"v": float(i)}} for i in range(5)], database="db", precision="ns"
         )
         assert "4 points without a timestamp" in caplog.text
 
     def test_no_warning_for_distinct_series_or_merged_fields(self, caplog: Any) -> None:
-        caplog.set_level("WARNING", logger="influxkit.validation")
+        caplog.set_level("WARNING", logger="sluicebox.validation")
         s = self.serializer()
         s.serialize(
             [

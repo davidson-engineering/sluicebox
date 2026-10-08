@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import InfluxClient, WriteError
+from sluicebox import InfluxClient, WriteError
 
 from .fake_server import FakeInflux
 

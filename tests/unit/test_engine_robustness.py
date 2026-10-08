@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import (
+from sluicebox import (
     AuthenticationError,
     ClientClosedError,
     ConfigurationError,
@@ -29,7 +29,7 @@ from influxkit import (
     WriteError,
     WriteFailure,
 )
-from influxkit.types import FieldType
+from sluicebox.types import FieldType
 
 from .fake_server import FakeInflux, Recorded, Reply, sequence
 
@@ -143,7 +143,7 @@ class TestLifecycle:
         """End to end: a process that never calls close() still delivers its points at exit."""
         script = textwrap.dedent(
             f"""
-            from influxkit import InfluxClient, load_settings
+            from sluicebox import InfluxClient, load_settings
             settings = load_settings(None, env_file=None, token="t",
                 connection={{"url": "{fake.url}", "version": 3, "database": "db"}})
             client = InfluxClient(settings)
@@ -161,7 +161,7 @@ class TestLifecycle:
     def test_exit_reports_lost_points_without_logging_setup(self) -> None:
         script = textwrap.dedent(
             """
-            from influxkit import InfluxClient, load_settings
+            from sluicebox import InfluxClient, load_settings
             settings = load_settings(None, env_file=None, token="t",
                 connection={"url": "http://127.0.0.1:9", "version": 3, "database": "db"},
                 write={"close_timeout": 0.5, "retry": {"initial_delay": 0.01}})
@@ -171,7 +171,7 @@ class TestLifecycle:
         result = subprocess.run(
             [sys.executable, "-c", script], capture_output=True, text=True, timeout=60, check=False
         )
-        assert "influxkit: at exit:" in result.stderr
+        assert "sluicebox: at exit:" in result.stderr
         assert "1 points not written" in result.stderr
 
     def test_futures_in_flight_at_fork_fail_in_the_child(
@@ -276,7 +276,7 @@ class TestFailureReporting:
         self, fake: FakeInflux, client_for: Callable[..., InfluxClient], caplog: Any
     ) -> None:
         fake.responder = lambda _: Reply(delay=0.3)
-        caplog.set_level(logging.WARNING, logger="influxkit.write")
+        caplog.set_level(logging.WARNING, logger="sluicebox.write")
         client = client_for(
             write={"on_full": "drop", "max_pending_bytes": 1024, "max_batch_bytes": 1024, "batch_size": 1}
         )
@@ -368,7 +368,7 @@ class TestMisconfiguration:
         with InfluxClient(settings, registry=CollectorRegistry()) as client:
             with pytest.raises(AuthenticationError) as info:
                 client.write(points(1)).result(timeout=5)
-            assert any("no token is configured: set INFLUXKIT_TOKEN" in note for note in info.value.__notes__)
+            assert any("no token is configured: set SLUICEBOX_TOKEN" in note for note in info.value.__notes__)
 
     def test_url_path_prefix_is_kept(self, fake: FakeInflux, client_for: Callable[..., InfluxClient]) -> None:
         client = client_for(connection={"url": fake.url + "/influx/"})
@@ -429,18 +429,18 @@ class TestMetricsForAlerting:
         registry = CollectorRegistry()
         with InfluxClient(make_settings(url=fake.url, name="alerts"), registry=registry) as client:
             labels = {"client": "alerts", "database": "db"}
-            assert registry.get_sample_value("influxkit_points_failed_total", labels) == 0
+            assert registry.get_sample_value("sluicebox_points_failed_total", labels) == 0
             assert (
                 registry.get_sample_value(
-                    "influxkit_points_dropped_total", {"client": "alerts", "reason": "buffer_full"}
+                    "sluicebox_points_dropped_total", {"client": "alerts", "reason": "buffer_full"}
                 )
                 == 0
             )
-            limit = registry.get_sample_value("influxkit_write_buffer_limit_bytes", {"client": "alerts"})
+            limit = registry.get_sample_value("sluicebox_write_buffer_limit_bytes", {"client": "alerts"})
             assert limit == client.settings.write.max_pending_bytes
             client.write(points(1)).result(timeout=5)
             last = registry.get_sample_value(
-                "influxkit_write_last_success_timestamp_seconds", {"client": "alerts"}
+                "sluicebox_write_last_success_timestamp_seconds", {"client": "alerts"}
             )
             assert last is not None
             assert abs(last - time.time()) < 60

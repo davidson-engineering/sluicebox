@@ -1,6 +1,6 @@
 """Exception hierarchy.
 
-Every exception raised by influxkit derives from :class:`InfluxKitError`, so callers can
+Every exception raised by sluicebox derives from :class:`SluiceboxError`, so callers can
 catch one type at the integration boundary and still branch on the specific failure:
 
 * :class:`ConfigurationError` - invalid settings, missing secrets or optional dependencies.
@@ -23,7 +23,6 @@ __all__ = [
     "ClientClosedError",
     "ConfigurationError",
     "InfluxConnectionError",
-    "InfluxKitError",
     "InfluxTimeoutError",
     "LineError",
     "NotFoundError",
@@ -34,6 +33,7 @@ __all__ = [
     "RateLimitedError",
     "ServerError",
     "ServiceUnavailableError",
+    "SluiceboxError",
     "TransportError",
     "UnprocessableEntityError",
     "ValidationError",
@@ -41,29 +41,29 @@ __all__ = [
 ]
 
 
-class InfluxKitError(Exception):
-    """Base class for all influxkit errors."""
+class SluiceboxError(Exception):
+    """Base class for all sluicebox errors."""
 
 
-class ConfigurationError(InfluxKitError):
+class ConfigurationError(SluiceboxError):
     """Settings are invalid, a secret is missing or misplaced, or an optional dependency is absent."""
 
 
-class ClientClosedError(InfluxKitError, RuntimeError):
+class ClientClosedError(SluiceboxError, RuntimeError):
     """The client (or its write engine) was used after ``close()``."""
 
     #: Points of the failed ``write()`` call that were buffered before the error (and will be sent).
     points_enqueued = 0
 
 
-class BufferFullError(InfluxKitError):
+class BufferFullError(SluiceboxError):
     """The write buffer is full and the configured overflow policy is ``raise`` (or blocking timed out)."""
 
     #: Points of the failed ``write()`` call that were buffered before the error (and will be sent).
     points_enqueued = 0
 
 
-class ValidationError(InfluxKitError, ValueError):
+class ValidationError(SluiceboxError, ValueError):
     """A record failed client-side validation.
 
     ``code`` is a stable, machine-readable reason (for example ``type_conflict``,
@@ -102,7 +102,7 @@ class ValidationError(InfluxKitError, ValueError):
         return prefix + (f"{self.message} ({', '.join(where)})" if where else self.message)
 
 
-class TransportError(InfluxKitError):
+class TransportError(SluiceboxError):
     """The request did not produce an HTTP response (network, TLS or timeout failure)."""
 
 
@@ -127,7 +127,7 @@ class LineError:
     line: str | None = None
 
 
-class ServerError(InfluxKitError):
+class ServerError(SluiceboxError):
     """The server answered with an HTTP error status."""
 
     def __init__(
@@ -213,7 +213,7 @@ class PartialWriteError(ServerError):
         self.rejected = rejected if rejected is not None else len(self.line_errors)
 
 
-class QueryError(InfluxKitError):
+class QueryError(SluiceboxError):
     """A query failed (syntax/planning error, unknown table, ...)."""
 
     def __init__(self, message: str, *, query: str | None = None, status: int | None = None) -> None:
@@ -223,7 +223,7 @@ class QueryError(InfluxKitError):
         self.status = status
 
 
-class WriteError(InfluxKitError):
+class WriteError(SluiceboxError):
     """One or more background write batches failed permanently.
 
     Raised by ``flush()`` and ``close()`` when no ``on_error`` handler is installed, so

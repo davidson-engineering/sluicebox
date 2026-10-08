@@ -5,14 +5,14 @@
 #   docker compose up -d --wait                          # the two servers
 #   docker/tls/generate.sh && \
 #   docker compose --profile network up -d --wait        # + TLS servers, Toxiproxy, nginx
-name: influxkit-dev
+name: sluicebox-dev
 
 x-influxdb2-env: &influxdb2-env
   DOCKER_INFLUXDB_INIT_MODE: setup
-  DOCKER_INFLUXDB_INIT_USERNAME: influxkit
+  DOCKER_INFLUXDB_INIT_USERNAME: sluicebox
   DOCKER_INFLUXDB_INIT_PASSWORD_FILE: /run/secrets/influxdb2-password
-  DOCKER_INFLUXDB_INIT_ORG: influxkit
-  DOCKER_INFLUXDB_INIT_BUCKET: influxkit
+  DOCKER_INFLUXDB_INIT_ORG: sluicebox
+  DOCKER_INFLUXDB_INIT_BUCKET: sluicebox
   DOCKER_INFLUXDB_INIT_ADMIN_TOKEN_FILE: /run/secrets/influxdb2-token
 
 # Every server waits for the generated credentials.
@@ -50,7 +50,7 @@ services:
     image: influxdb:3.12.0-core
     command:
       - serve
-      - --node-id=influxkit-dev
+      - --node-id=sluicebox-dev
       - --object-store=memory
       - --admin-token-file=/run/secrets/influxdb3-admin-token.json
     ports:
@@ -120,7 +120,7 @@ services:
     profiles: [network]
     command:
       - serve
-      - --node-id=influxkit-dev-tls
+      - --node-id=sluicebox-dev-tls
       - --object-store=memory
       - --admin-token-file=/run/secrets/influxdb3-admin-token.json
       - --tls-cert=/etc/tls/server.crt

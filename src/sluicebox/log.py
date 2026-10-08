@@ -1,10 +1,10 @@
 """Logging helpers.
 
-influxkit logs under the ``influxkit`` logger hierarchy (``influxkit.write``,
-``influxkit.query``, ``influxkit.transport``, ``influxkit.config``...) and, like any
+sluicebox logs under the ``sluicebox`` logger hierarchy (``sluicebox.write``,
+``sluicebox.query``, ``sluicebox.transport``, ``sluicebox.config``...) and, like any
 library, only attaches a ``NullHandler``: by default its records propagate to the
 application's handlers. :func:`configure_logging` (or ``[logging] configure = true``) is for
-applications without logging setup: it gives the ``influxkit`` logger its own stderr handler
+applications without logging setup: it gives the ``sluicebox`` logger its own stderr handler
 and stops propagation, so records are not printed twice.
 
 Log records carry structured context in ``record.influx`` (a dict: client, database, points,
@@ -26,8 +26,8 @@ from .config import LoggingConfig
 
 __all__ = ["JsonFormatter", "RateLimitedLog", "configure_logging"]
 
-ROOT = "influxkit"
-_HANDLER_MARK = "_influxkit_handler"
+ROOT = "sluicebox"
+_HANDLER_MARK = "_sluicebox_handler"
 # Shared by all RateLimitedLog instances: held only for a dict update.
 _RATE_LOCK = threading.Lock()
 
@@ -47,7 +47,7 @@ _STANDARD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)))
 class JsonFormatter(logging.Formatter):
     """One JSON object per line: time, level, logger, message, structured context, exception.
 
-    Structured context is ``record.influx`` (set by influxkit) plus any other ``extra=``
+    Structured context is ``record.influx`` (set by sluicebox) plus any other ``extra=``
     attributes, as top-level keys.
     """
 
@@ -87,10 +87,10 @@ def configure_logging(
     format: Literal["text", "json"] | None = None,
     stream: Any = None,
 ) -> logging.Logger:
-    """Give the ``influxkit`` logger its own handler (idempotent); it stops propagating.
+    """Give the ``sluicebox`` logger its own handler (idempotent); it stops propagating.
 
     For applications that do not configure logging themselves. With your own logging setup,
-    leave this off: influxkit's records then propagate to your handlers.
+    leave this off: sluicebox's records then propagate to your handlers.
 
     Args:
         config: A ``[logging]`` section; ``level`` and ``format`` override its values.

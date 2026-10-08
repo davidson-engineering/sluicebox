@@ -153,7 +153,7 @@ def measurement(
 
     def decorate(cls: T) -> T:
         spec = _build_spec(cls, name or cls.__name__, set(tags), timestamp)
-        cls.__influxkit_model__ = spec  # type: ignore[attr-defined]
+        cls.__sluicebox_model__ = spec  # type: ignore[attr-defined]
         return cls
 
     return decorate

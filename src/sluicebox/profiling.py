@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 __all__ = ["ProfileReport", "StageStats", "profile"]
 
-log = logging.getLogger("influxkit.profiling")
+log = logging.getLogger("sluicebox.profiling")
 
 
 @dataclass
@@ -137,7 +137,7 @@ def profile(
     Args:
         path: Also dump raw stats here (open with ``snakeviz``/``pstats``).
         memory: Track allocations with ``tracemalloc`` and report the peak and top sites.
-        log_summary: Log the summary at INFO on the ``influxkit.profiling`` logger.
+        log_summary: Log the summary at INFO on the ``sluicebox.profiling`` logger.
         limit: Number of rows in the logged summary.
 
     Background sender threads are not included; their cost shows up in stage timings.

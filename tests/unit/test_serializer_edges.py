@@ -10,12 +10,12 @@ from typing import Any
 import numpy as np
 import pytest
 
-from influxkit import ValidationError
-from influxkit._lineprotocol import Dialect
-from influxkit._serializer import Serializer
-from influxkit.config import MeasurementSchema, TagsConfig, ValidationConfig
-from influxkit.tags import TagInjector
-from influxkit.types import FieldType
+from sluicebox import ValidationError
+from sluicebox._lineprotocol import Dialect
+from sluicebox._serializer import Serializer
+from sluicebox.config import MeasurementSchema, TagsConfig, ValidationConfig
+from sluicebox.tags import TagInjector
+from sluicebox.types import FieldType
 
 T0 = 1_700_000_000_000_000_000
 
@@ -119,7 +119,7 @@ class TestTimestamps:
         ]
 
     def test_seconds_with_nanosecond_precision_warn(self, caplog: Any) -> None:
-        caplog.set_level(logging.WARNING, logger="influxkit.validation")
+        caplog.set_level(logging.WARNING, logger="sluicebox.validation")
         lines = serialize(make(), {"measurement": "m", "fields": {"v": 1.0}, "time": 1_700_000_000})
         assert lines == ["m v=1.0 1700000000"]  # written as given
         assert "precision='s'" in caplog.text
@@ -152,7 +152,7 @@ class TestMisc:
             serialize(serializer, {"measurement": "m", "fields": {"v": 1.0}})
 
     def test_untimed_points_differing_in_skipped_fields_do_not_warn(self, caplog: Any) -> None:
-        caplog.set_level(logging.WARNING, logger="influxkit.validation")
+        caplog.set_level(logging.WARNING, logger="sluicebox.validation")
         serializer = Serializer(
             dialect=Dialect.for_version(3),
             validation=ValidationConfig(),
@@ -179,10 +179,10 @@ class TestMisc:
         assert serialize(serializer, {"measurement": "m", "fields": {"v": 2.5}}) == ["m v=2.5"]
 
     def test_high_tag_cardinality_warns_once(self, caplog: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        import influxkit._serializer as module
+        import sluicebox._serializer as module
 
         monkeypatch.setattr(module, "_TAGSET_CACHE_LIMIT", 10)
-        caplog.set_level(logging.WARNING, logger="influxkit.validation")
+        caplog.set_level(logging.WARNING, logger="sluicebox.validation")
         serializer = make()
         records = [
             {"measurement": "req", "tags": {"request_id": str(i)}, "fields": {"v": 1.0}} for i in range(100)

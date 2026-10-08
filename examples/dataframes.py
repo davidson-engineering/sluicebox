@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import polars as pl
 
-from influxkit import InfluxClient
+from sluicebox import InfluxClient
 
 now = datetime.now(UTC)
 frame = pl.DataFrame(

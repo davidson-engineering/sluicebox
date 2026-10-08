@@ -1,12 +1,12 @@
-# influxkit configuration reference (copy to influxkit.toml and adjust [connection]).
+# sluicebox configuration reference (copy to sluicebox.toml and adjust [connection]).
 # Every active value below is the default; only [connection] is required.
 #
 # Secrets do NOT belong here: put the token in the environment or a .env file
-#   INFLUXKIT_TOKEN=...            (or INFLUXKIT_TOKEN_FILE=/run/secrets/influx-token)
+#   SLUICEBOX_TOKEN=...            (or SLUICEBOX_TOKEN_FILE=/run/secrets/influx-token)
 # Any setting can also be overridden by an environment variable, e.g.
-#   INFLUXKIT_CONNECTION__URL=https://influx.internal:8181
-#   INFLUXKIT_WRITE__BATCH_SIZE=50000
-# INFLUXKIT_CONFIG=path/to/file.toml and INFLUXKIT_SECTION=prod pick the file and a table in it.
+#   SLUICEBOX_CONNECTION__URL=https://influx.internal:8181
+#   SLUICEBOX_WRITE__BATCH_SIZE=50000
+# SLUICEBOX_CONFIG=path/to/file.toml and SLUICEBOX_SECTION=prod pick the file and a table in it.
 # Durations accept "250ms", "30s", "1h30m"; sizes accept "8MiB", "512KB".
 
 name = "ingest"                     # label for metrics and logs
@@ -22,7 +22,7 @@ verify_ssl = true
 # ca_cert = "/etc/ssl/internal-ca.pem"
 # client_cert = "/etc/ssl/client.pem"   # mutual TLS
 # client_key = "/etc/ssl/client.key"
-# proxy = "http://proxy.internal:3128"  # credentials go in INFLUXKIT_CONNECTION__PROXY, not here
+# proxy = "http://proxy.internal:3128"  # credentials go in SLUICEBOX_CONNECTION__PROXY, not here
 # pool_size = 18                    # default: write.concurrency + 2
 
 [write]
@@ -100,7 +100,7 @@ on_conflict = "keep"                # keep the point's value | overwrite | error
 
 [metrics]
 enabled = true
-namespace = "influxkit"
+namespace = "sluicebox"
 # port = 9108                       # serve /metrics (once per process); omit if your app exports metrics
 
 [profiling]
@@ -109,7 +109,7 @@ slow_batch_threshold = "5s"
 slow_query_threshold = "10s"
 
 [logging]
-configure = false                   # true: install a handler on the "influxkit" logger
+configure = false                   # true: install a handler on the "sluicebox" logger
 level = "INFO"
 format = "text"                     # text | json
 log_rejected_lines = 5

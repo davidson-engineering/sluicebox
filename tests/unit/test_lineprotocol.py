@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from influxkit._lineprotocol import Dialect, LineSyntaxError, UInt, parse_line
+from sluicebox._lineprotocol import Dialect, LineSyntaxError, UInt, parse_line
 
 V2 = Dialect.for_version(2)
 V3 = Dialect.for_version(3)

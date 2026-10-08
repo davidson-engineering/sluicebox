@@ -1,10 +1,10 @@
-"""influxkit: high-throughput, validated and observable writes and queries for InfluxDB 2 and 3.
+"""sluicebox: high-throughput, validated and observable writes and queries for InfluxDB 2 and 3.
 
 Quick start::
 
-    from influxkit import InfluxClient
+    from sluicebox import InfluxClient
 
-    with InfluxClient.from_config("influxkit.toml") as client:   # token from .env
+    with InfluxClient.from_config("sluicebox.toml") as client:   # token from .env
         client.write({"measurement": "cpu", "tags": {"host": "a"}, "fields": {"usage": 0.5}})
         rows = client.query("SELECT * FROM cpu LIMIT 10").to_dicts()
 """
@@ -22,7 +22,6 @@ from .exceptions import (
     ClientClosedError,
     ConfigurationError,
     InfluxConnectionError,
-    InfluxKitError,
     InfluxTimeoutError,
     LineError,
     NotFoundError,
@@ -33,6 +32,7 @@ from .exceptions import (
     RateLimitedError,
     ServerError,
     ServiceUnavailableError,
+    SluiceboxError,
     TransportError,
     UnprocessableEntityError,
     ValidationError,
@@ -85,7 +85,7 @@ __all__ = [
     "ProfileReport",
     "StageStats",
     # errors
-    "InfluxKitError",
+    "SluiceboxError",
     "ConfigurationError",
     "ValidationError",
     "ClientClosedError",

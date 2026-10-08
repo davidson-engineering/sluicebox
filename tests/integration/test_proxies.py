@@ -16,8 +16,8 @@ from urllib.parse import urlsplit
 import pytest
 from prometheus_client import CollectorRegistry
 
-from influxkit import InfluxClient, load_settings
-from influxkit.client import flux_string
+from sluicebox import InfluxClient, load_settings
+from sluicebox.client import flux_string
 from tests.servers import (
     V2_BUCKET,
     V2_ORG,

@@ -23,7 +23,7 @@ from .exceptions import (
     BufferFullError,
     ClientClosedError,
     ConfigurationError,
-    InfluxKitError,
+    SluiceboxError,
     ValidationError,
 )
 from .futures import MAX_REJECTED, WriteFuture, warn_if_event_loop
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
 __all__ = ["ClientStats", "InfluxClient", "ServerInfo"]
 
-log = logging.getLogger("influxkit.client")
+log = logging.getLogger("sluicebox.client")
 
 # Serializes the lazy creation of query backends (rare and quick).
 _backend_lock = threading.Lock()
@@ -98,7 +98,7 @@ class InfluxClient:
     """High-throughput client for InfluxDB 2 and InfluxDB 3.
 
     Writes are **asynchronous**: :meth:`write` validates and serializes on the calling
-    thread, buffers the result and returns a :class:`~influxkit.futures.WriteFuture`
+    thread, buffers the result and returns a :class:`~sluicebox.futures.WriteFuture`
     immediately; background threads batch, compress and send. Call ``.result()`` on the
     future (or :meth:`flush`) when you need the server's acknowledgement.
 
@@ -108,7 +108,7 @@ class InfluxClient:
 
     Args:
         settings: Complete settings. If omitted, they are loaded with
-            :func:`~influxkit.config.load_settings` and ``overrides``.
+            :func:`~sluicebox.config.load_settings` and ``overrides``.
         tags: Extra static tags added to every point (on top of ``[tags] static``).
         enrichers: Callables ``(measurement, tags, fields) -> {tag: value} | None`` that add
             tags based on point content.
@@ -142,7 +142,7 @@ class InfluxClient:
         self._database = settings.connection.database
         self._precision: Precision = settings.write.precision
         self._chunk_size = settings.write.batch_size
-        self._drop_log = RateLimitedLog(logging.getLogger("influxkit.validation"))
+        self._drop_log = RateLimitedLog(logging.getLogger("sluicebox.validation"))
         self._injector = TagInjector(settings.tags, static=tags, enrichers=enrichers)
         self._serializer = Serializer(
             dialect=self._dialect,
@@ -172,7 +172,7 @@ class InfluxClient:
             database=settings.connection.database,
         )
         log.info(
-            "influxkit client %r ready: InfluxDB %s at %s, database %r, write endpoint %s",
+            "sluicebox client %r ready: InfluxDB %s at %s, database %r, write endpoint %s",
             settings.name,
             settings.connection.version,
             settings.connection.url,
@@ -187,7 +187,7 @@ class InfluxClient:
         *,
         section: str | None = None,
         env_file: str | os.PathLike[str] | None = ".env",
-        env_prefix: str = "INFLUXKIT_",
+        env_prefix: str = "SLUICEBOX_",
         secrets_dir: str | os.PathLike[str] | None = None,
         tags: Mapping[str, str] | None = None,
         enrichers: Sequence[Enricher] = (),
@@ -332,7 +332,7 @@ class InfluxClient:
     def _record_chunks(self, data: Any, database: str, precision: Precision) -> Iterator[SerializedChunk]:
         now_ns = time.time_ns()
         serialize = self._serializer.serialize
-        if isinstance(data, _SINGLE_RECORD_TYPES) or hasattr(type(data), "__influxkit_model__"):
+        if isinstance(data, _SINGLE_RECORD_TYPES) or hasattr(type(data), "__sluicebox_model__"):
             yield serialize((data,), database=database, precision=precision, now_ns=now_ns)
             return
         size = self._chunk_size
@@ -384,7 +384,7 @@ class InfluxClient:
     def flush(self, timeout: float | None = None) -> None:
         """Send everything buffered and wait for the server's answers.
 
-        Raises :class:`~influxkit.exceptions.WriteError` for failed batches whose errors nobody
+        Raises :class:`~sluicebox.exceptions.WriteError` for failed batches whose errors nobody
         retrieved from their futures (unless an ``on_error`` handler is installed).
         """
         warn_if_event_loop("InfluxClient.flush()", "use 'await AsyncInfluxClient.flush()'")
@@ -444,7 +444,7 @@ class InfluxClient:
         previous = self._serializer.relock(database, measurement, key, kind)
         if previous is not None:
             log.warning(
-                "the server stores field %r of %r as %s, but influxkit had locked it as %s from an "
+                "the server stores field %r of %r as %s, but sluicebox had locked it as %s from an "
                 "earlier value; it is now locked as %s (call sync_schema() at startup to learn "
                 "stored types up front)",
                 key,
@@ -514,7 +514,7 @@ class InfluxClient:
         started = time.perf_counter()
         try:
             result = run_query(self._backend(), query, chosen, database or self._database, params, timeout)
-        except InfluxKitError as error:
+        except SluiceboxError as error:
             self._metrics.query(chosen, "error", time.perf_counter() - started)
             self._metrics.error("query", error)
             _hint_language(error, query, chosen)
@@ -553,7 +553,7 @@ class InfluxClient:
             ):
                 rows += chunk.num_rows
                 yield chunk
-        except InfluxKitError as error:
+        except SluiceboxError as error:
             self._metrics.query(chosen, "error", time.perf_counter() - started)
             self._metrics.error("query", error)
             raise
@@ -708,7 +708,7 @@ class InfluxClient:
     def profile(
         self, path: str | Path | None = None, *, memory: bool = False, log_summary: bool = False
     ) -> AbstractContextManager[ProfileReport]:
-        """Profile a block of code with cProfile (see :func:`influxkit.profiling.profile`)."""
+        """Profile a block of code with cProfile (see :func:`sluicebox.profiling.profile`)."""
         return profile(path, memory=memory, log_summary=log_summary)
 
     def close(self, timeout: float | None = None) -> None:
@@ -716,7 +716,7 @@ class InfluxClient:
 
         Waits up to ``timeout`` seconds (default ``write.close_timeout``) for buffered data.
 
-        Raises :class:`~influxkit.exceptions.WriteError` if batches failed and no ``on_error``
+        Raises :class:`~sluicebox.exceptions.WriteError` if batches failed and no ``on_error``
         handler is installed. Idempotent.
         """
         if self._closed:
@@ -733,7 +733,7 @@ class InfluxClient:
                 backend.close()
             except Exception:  # pragma: no cover - best effort
                 log.debug("error closing query backend", exc_info=True)
-        log.info("influxkit client %r closed", self._settings.name)
+        log.info("sluicebox client %r closed", self._settings.name)
         if failure is not None:
             raise failure
 
@@ -752,7 +752,7 @@ class InfluxClient:
             return
         try:
             self.close()
-        except InfluxKitError as close_error:  # do not mask the original exception
+        except SluiceboxError as close_error:  # do not mask the original exception
             log.error("while closing after an exception: %s", close_error)
 
     def __repr__(self) -> str:

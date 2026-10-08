@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from influxkit import ConfigurationError, InfluxSettings, load_settings
-from influxkit._units import parse_duration
-from influxkit.types import FieldType
+from sluicebox import ConfigurationError, InfluxSettings, load_settings
+from sluicebox._units import parse_duration
+from sluicebox.types import FieldType
 
 CONFIG = """
 name = "ingest"
@@ -41,16 +41,16 @@ set = { site = "{site}" }
 
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
-    path = tmp_path / "influxkit.toml"
+    path = tmp_path / "sluicebox.toml"
     path.write_text(CONFIG)
     (tmp_path / ".env").write_text(
-        "INFLUXKIT_TOKEN=secret-from-dotenv\nINFLUXKIT_WRITE__CONCURRENCY=8\nOTHER_APP=1\n"
+        "SLUICEBOX_TOKEN=secret-from-dotenv\nSLUICEBOX_WRITE__CONCURRENCY=8\nOTHER_APP=1\n"
     )
     return path
 
 
 def test_layered_loading(config_file: Path) -> None:
-    settings = load_settings()  # finds ./influxkit.toml and ./.env
+    settings = load_settings()  # finds ./sluicebox.toml and ./.env
     assert settings.name == "ingest"
     assert settings.connection.url == "http://localhost:8181"
     assert settings.connection.version == 3
@@ -68,7 +68,7 @@ def test_layered_loading(config_file: Path) -> None:
 
 
 def test_precedence(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("INFLUXKIT_WRITE__BATCH_SIZE", "777")
+    monkeypatch.setenv("SLUICEBOX_WRITE__BATCH_SIZE", "777")
     assert load_settings().write.batch_size == 777  # env beats .env and TOML
     settings = load_settings(write={"batch_size": 999})
     assert settings.write.batch_size == 999  # keyword overrides beat everything
@@ -131,7 +131,7 @@ def test_invalid_configs(tmp_path: Path, toml: str, message: str) -> None:
 def test_v2_needs_a_token(tmp_path: Path) -> None:
     path = tmp_path / "c.toml"
     path.write_text('[connection]\nurl = "http://x"\nversion = 2\ndatabase = "b"\norg = "o"\n')
-    with pytest.raises(ConfigurationError, match="INFLUXKIT_TOKEN"):
+    with pytest.raises(ConfigurationError, match="SLUICEBOX_TOKEN"):
         load_settings(path, env_file=None)
     assert load_settings(path, env_file=None, token="t").token is not None
 
@@ -140,8 +140,8 @@ def test_typo_in_dotenv_is_reported(tmp_path: Path) -> None:
     path = tmp_path / "c.toml"
     path.write_text('[connection]\nurl = "http://x"\nversion = 3\ndatabase = "d"\n')
     env = tmp_path / ".env.test"
-    env.write_text("INFLUXKIT_TOKN=x\n")
-    with pytest.raises(ConfigurationError, match="influxkit_tokn"):
+    env.write_text("SLUICEBOX_TOKN=x\n")
+    with pytest.raises(ConfigurationError, match="sluicebox_tokn"):
         load_settings(path, env_file=env)
 
 
@@ -161,7 +161,7 @@ def test_section_and_env_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 def test_config_path_from_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "elsewhere.toml"
     path.write_text('[connection]\nurl = "http://z"\nversion = 3\ndatabase = "from-env-path"\n')
-    monkeypatch.setenv("INFLUXKIT_CONFIG", str(path))
+    monkeypatch.setenv("SLUICEBOX_CONFIG", str(path))
     assert load_settings(env_file=None).connection.database == "from-env-path"
     with pytest.raises(ConfigurationError, match="not found"):
         load_settings(tmp_path / "missing.toml")
@@ -170,7 +170,7 @@ def test_config_path_from_environment(tmp_path: Path, monkeypatch: pytest.Monkey
 def test_secrets_dir(tmp_path: Path) -> None:
     secrets = tmp_path / "secrets"
     secrets.mkdir()
-    (secrets / "influxkit_token").write_text("from-secrets-dir")
+    (secrets / "sluicebox_token").write_text("from-secrets-dir")
     settings = load_settings(
         None,
         env_file=None,
@@ -226,7 +226,7 @@ def test_proxy_password_in_toml_is_refused(tmp_path: Path) -> None:
 
 def test_example_config_is_valid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The documented example must always load (and therefore document real options)."""
-    example = Path(__file__).resolve().parents[2] / "influxkit.example.toml"
+    example = Path(__file__).resolve().parents[2] / "sluicebox.example.toml"
     settings = load_settings(example, env_file=None, token="t")  # usable as copied
     assert settings.write.batch_size == 25_000
     assert settings.write.concurrency == 16
@@ -252,12 +252,12 @@ def test_example_config_is_valid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     for section in ("write", "query", "validation", "metrics", "profiling", "logging"):
         documented = getattr(settings, section).model_dump(exclude={"retry"})
         default = getattr(defaults, section).model_dump(exclude={"retry"})
-        assert documented == default, f"[{section}] in influxkit.example.toml no longer matches the defaults"
+        assert documented == default, f"[{section}] in sluicebox.example.toml no longer matches the defaults"
     assert settings.write.retry == defaults.write.retry
 
 
 def _minimal(tmp_path: Path, extra: str = "") -> Path:
-    path = tmp_path / "influxkit.toml"
+    path = tmp_path / "sluicebox.toml"
     path.write_text(f'[connection]\nurl = "http://localhost:8181"\nversion = 3\ndatabase = "d"\n{extra}')
     return path
 
@@ -274,8 +274,8 @@ def test_missing_config_file_says_where_it_looked(tmp_path: Path, monkeypatch: p
         load_settings(env_file=None, token="t")
     message = str(info.value)
     assert "no config file was found" in message
-    assert str(tmp_path / "influxkit.toml") in message
-    assert "INFLUXKIT_CONNECTION__URL" in message
+    assert str(tmp_path / "sluicebox.toml") in message
+    assert "SLUICEBOX_CONNECTION__URL" in message
 
 
 def test_token_anywhere_in_the_toml_is_refused(tmp_path: Path) -> None:
@@ -302,9 +302,9 @@ def test_environment_selects_section_and_token_file(tmp_path: Path, monkeypatch:
     )
     secret = tmp_path / "token"
     secret.write_text("from-a-file\n")
-    monkeypatch.setenv("INFLUXKIT_CONFIG", str(path))
-    monkeypatch.setenv("INFLUXKIT_SECTION", "prod")
-    monkeypatch.setenv("INFLUXKIT_TOKEN_FILE", str(secret))
+    monkeypatch.setenv("SLUICEBOX_CONFIG", str(path))
+    monkeypatch.setenv("SLUICEBOX_SECTION", "prod")
+    monkeypatch.setenv("SLUICEBOX_TOKEN_FILE", str(secret))
     settings = load_settings(env_file=None)
     assert settings.connection.url == "http://prod:8181"
     assert settings.token is not None
@@ -314,15 +314,15 @@ def test_environment_selects_section_and_token_file(tmp_path: Path, monkeypatch:
 def test_unknown_environment_variables_are_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setenv("INFLUXKIT_DATABASE", "prod_db")
+    monkeypatch.setenv("SLUICEBOX_DATABASE", "prod_db")
     load_settings(_minimal(tmp_path), env_file=None)
-    assert "INFLUXKIT_DATABASE is not an influxkit setting" in caplog.text
-    assert "did you mean INFLUXKIT_CONNECTION__DATABASE?" in caplog.text
-    monkeypatch.setenv("INFLUXKIT_WRITE__BATCHSIZE", "1")  # inside a known table: an error
+    assert "SLUICEBOX_DATABASE is not an sluicebox setting" in caplog.text
+    assert "did you mean SLUICEBOX_CONNECTION__DATABASE?" in caplog.text
+    monkeypatch.setenv("SLUICEBOX_WRITE__BATCHSIZE", "1")  # inside a known table: an error
     with pytest.raises(ConfigurationError) as info:
         load_settings(_minimal(tmp_path), env_file=None)
     assert "did you mean 'batch_size'?" in str(info.value)
-    assert "[from environment variable INFLUXKIT_WRITE__BATCHSIZE]" in str(info.value)
+    assert "[from environment variable SLUICEBOX_WRITE__BATCHSIZE]" in str(info.value)
 
 
 @pytest.mark.parametrize(
@@ -339,8 +339,8 @@ def test_url_paths(url: str, expected: str) -> None:
 
 
 def test_optional_environment_tags() -> None:
-    from influxkit.config import TagsConfig
-    from influxkit.tags import TagInjector
+    from sluicebox.config import TagsConfig
+    from sluicebox.tags import TagInjector
 
     config = TagsConfig.model_validate(
         {"from_env": {"pod": {"var": "POD_NAME", "default": "local"}, "zone": {"var": "ZONE", "default": ""}}}
@@ -353,7 +353,7 @@ def test_optional_environment_tags() -> None:
 
 
 def test_static_tags_argument_is_not_for_settings() -> None:
-    from influxkit import InfluxClient
+    from sluicebox import InfluxClient
 
     with pytest.raises(TypeError, match=r"\['on_conflict'\] are \[tags\] settings"):
         InfluxClient(tags={"on_conflict": "overwrite"})

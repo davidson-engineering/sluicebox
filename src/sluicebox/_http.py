@@ -44,9 +44,9 @@ if TYPE_CHECKING:
 
 __all__ = ["Response", "Transport", "error_from_response", "parse_retry_after"]
 
-log = logging.getLogger("influxkit.transport")
+log = logging.getLogger("sluicebox.transport")
 
-USER_AGENT = f"influxkit/{__version__}"
+USER_AGENT = f"sluicebox/{__version__}"
 
 
 def _keepalive_options() -> list[tuple[int, int, int]]:

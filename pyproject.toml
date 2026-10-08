@@ -1,5 +1,5 @@
 [project]
-name = "influxkit"
+name = "sluicebox"
 version = "0.1.0"
 description = "High-throughput, validated and observable writes and queries for InfluxDB 2 and InfluxDB 3"
 readme = "README.md"
@@ -24,17 +24,21 @@ dependencies = [
     "urllib3>=2.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/davidson-engineering/sluicebox"
+Issues = "https://github.com/davidson-engineering/sluicebox/issues"
+
 [project.optional-dependencies]
 # Query support wraps the official clients; writes never need them.
 v2 = ["influxdb-client>=1.40"]
 v3 = ["influxdb3-python>=0.12"]
 polars = ["polars>=1.0"]
 pandas = ["pandas>=2.0"]
-all = ["influxkit[v2,v3,polars,pandas]"]
+all = ["sluicebox[v2,v3,polars,pandas]"]
 
 [dependency-groups]
 dev = [
-    "influxkit[all]",
+    "sluicebox[all]",
     "mypy>=1.13",
     "pandas-stubs>=2.2",
     "pytest>=8.3",
@@ -75,7 +79,7 @@ runtime-evaluated-base-classes = ["pydantic.BaseModel", "pydantic_settings.BaseS
 python_version = "3.11"
 strict = true
 warn_unreachable = true
-files = ["src/influxkit"]
+files = ["src/sluicebox"]
 
 [[tool.mypy.overrides]]
 # Optional, partially typed dependencies are treated as Any at the integration boundary.
@@ -91,5 +95,5 @@ timeout = 120
 filterwarnings = ["error"]
 
 [tool.coverage.run]
-source = ["influxkit"]
+source = ["sluicebox"]
 branch = true
