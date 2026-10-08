@@ -333,7 +333,7 @@ class V2QueryBackend:
 
     def records(self, query: str, params: Mapping[str, Any] | None) -> Iterator[dict[str, Any]]:
         if params:
-            query = flux_params(params) + query
+            query = bind_flux_params(query, params)
         try:
             for record in self._api.query_stream(query, org=self._org):
                 yield record.values
@@ -344,7 +344,7 @@ class V2QueryBackend:
 
     def tables(self, query: str, params: Mapping[str, Any] | None) -> Any:
         if params:
-            query = flux_params(params) + query
+            query = bind_flux_params(query, params)
         try:
             return self._api.query(query, org=self._org)
         except Exception as exc:
@@ -366,6 +366,30 @@ def flux_params(params: Mapping[str, Any]) -> str:
     Values never become Flux code, so this is injection-safe.
     """
     return f"option params = {_flux_literal(dict(params))}\n"
+
+
+# One token of what may precede a Flux script's body: whitespace, a comment, or (group 1) the
+# package clause or an import statement.
+_FLUX_HEADER_TOKEN = re.compile(
+    r'\s+|//[^\n]*|(package\s+[A-Za-z_]\w*|import\s+(?:[A-Za-z_]\w*\s+)?"(?:[^"\\]|\\.)*")', re.ASCII
+)
+
+
+def bind_flux_params(query: str, params: Mapping[str, Any]) -> str:
+    """``query`` with the ``params`` option bound before its body.
+
+    Flux requires the package clause and imports to come first, so the option goes right
+    after the last of them (or at the very start when there are none).
+    """
+    option = flux_params(params)
+    pos = header_end = 0
+    while (token := _FLUX_HEADER_TOKEN.match(query, pos)) is not None:
+        pos = token.end()
+        if token.group(1):
+            header_end = pos
+    if not header_end:
+        return option + query
+    return f"{query[:header_end]}\n{option}{query[header_end:]}"
 
 
 def _flux_literal(value: Any) -> str:

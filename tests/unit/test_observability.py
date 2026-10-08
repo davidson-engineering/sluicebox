@@ -26,7 +26,7 @@ from sluicebox import (
 )
 from sluicebox.config import LoggingConfig
 from sluicebox.log import RateLimitedLog
-from sluicebox.query import QueryResult, flux_params
+from sluicebox.query import QueryResult, bind_flux_params, flux_params
 
 from .fake_server import FakeInflux, Reply
 
@@ -294,6 +294,23 @@ class TestQueryHelpers:
     def test_flux_params_rejects(self, bad: dict[str, Any]) -> None:
         with pytest.raises(ValueError, match="Flux"):
             flux_params(bad)
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("from(bucket: params.b)", "OPTION\nfrom(bucket: params.b)"),
+            ('import "strings"\nx', 'import "strings"\nOPTION\n\nx'),
+            (
+                '// header\npackage main\n  import s "strings" // why\nimport "array"\n\n// body\nx',
+                '// header\npackage main\n  import s "strings" // why\nimport "array"\nOPTION\n\n\n// body\nx',
+            ),
+            ('import "a\\"b"\nimport_data = 1', 'import "a\\"b"\nOPTION\n\nimport_data = 1'),
+            ('// import "strings"\nx', 'OPTION\n// import "strings"\nx'),
+        ],
+    )
+    def test_flux_params_follow_imports(self, query: str, expected: str) -> None:
+        option = flux_params({"b": 1}).rstrip("\n")
+        assert bind_flux_params(query, {"b": 1}) == expected.replace("OPTION", option)
 
     def test_query_result_from_records(self) -> None:
         result = QueryResult(records=[{"a": 1, "b": "x"}, {"a": 2, "c": True}], query="q", language="flux")

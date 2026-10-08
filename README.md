@@ -373,8 +373,8 @@ for chunk in client.query_stream("SELECT * FROM big_table"):  # bounded memory
 
 Prefer `params` to string formatting. On InfluxDB 3, datetime parameters are sent as RFC 3339
 strings. On InfluxDB 2, Flux parameters are bound as escaped literals in an `option params = {...}`
-record, so `params.name` works on InfluxDB OSS too (the official client relies on a Cloud-only
-API feature); pass datetimes for Flux times. Writes are asynchronous: `flush()` before querying
+record (placed after the query's `import` statements), so `params.name` works on InfluxDB OSS
+too (the official client relies on a Cloud-only API feature); pass datetimes for Flux times. Writes are asynchronous: `flush()` before querying
 data you just wrote.
 
 Results: InfluxDB 3 timestamp columns are timezone-aware (UTC). InfluxDB 2 results come from the

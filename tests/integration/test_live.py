@@ -272,6 +272,12 @@ def test_query_parameters_and_errors(live_client: InfluxClient, unique: str) -> 
         )
         result = live_client.query(flux, params={"bucket": V2_BUCKET, "host": "a"})
         assert [r["_value"] for r in result] == [0.0, 3.0]
+        # Flux wants imports first: the params option goes after them.
+        imported = live_client.query(
+            f'// comment\nimport "strings"\n{flux.replace("params.host", "strings.toLower(v: params.host)")}',
+            params={"bucket": V2_BUCKET, "host": "A"},
+        )
+        assert [r["_value"] for r in imported] == [0.0, 3.0]
         with pytest.raises(QueryError):
             live_client.query("from(bucket:")
 
