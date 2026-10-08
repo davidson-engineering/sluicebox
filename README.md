@@ -1,5 +1,9 @@
 # sluicebox
 
+[![PyPI](https://img.shields.io/pypi/v/sluicebox)](https://pypi.org/project/sluicebox/)
+[![Python](https://img.shields.io/pypi/pyversions/sluicebox)](https://pypi.org/project/sluicebox/)
+[![CI](https://github.com/davidson-engineering/sluicebox/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/davidson-engineering/sluicebox/actions/workflows/ci.yml)
+
 High-throughput, validated and observable writes and queries for **InfluxDB 2** and **InfluxDB 3**,
 built to drop into an application and push large volumes of data as fast as the server accepts them.
 
