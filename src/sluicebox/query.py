@@ -124,11 +124,8 @@ class QueryResult:
         return f"<QueryResult rows={self.num_rows} columns={self.columns[:8]} {self.duration * 1000:.1f} ms>"
 
 
-_SOURCE = "git+https://github.com/davidson-engineering/sluicebox"
-
-
 def _install_hint(extra: str) -> str:
-    return f"install sluicebox with the '{extra}' extra (uv add 'sluicebox[{extra}] @ {_SOURCE}')"
+    return f"install the '{extra}' extra (uv add 'sluicebox[{extra}]' or pip install 'sluicebox[{extra}]')"
 
 
 def _require(module: str, extra: str) -> Any:

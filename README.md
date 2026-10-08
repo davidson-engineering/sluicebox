@@ -43,14 +43,12 @@ urllib3 transport, so ingest-only applications need neither.
 
 ## Install
 
-sluicebox is installed from GitHub (it is not on PyPI). Pick the extras you need:
-
 ```bash
-uv add 'sluicebox @ git+https://github.com/davidson-engineering/sluicebox'           # writes only
-uv add 'sluicebox[v3] @ git+https://github.com/davidson-engineering/sluicebox'       # + InfluxDB 3 queries
-uv add 'sluicebox[v2] @ git+https://github.com/davidson-engineering/sluicebox'       # + InfluxDB 2 queries
-uv add 'sluicebox[polars] @ git+https://github.com/davidson-engineering/sluicebox'   # + polars DataFrames
-uv add 'sluicebox[all] @ git+https://github.com/davidson-engineering/sluicebox'      # all, plus pandas
+uv add sluicebox                    # writes only
+uv add 'sluicebox[v3]'              # + InfluxDB 3 queries
+uv add 'sluicebox[v2]'              # + InfluxDB 2 queries
+uv add 'sluicebox[polars]'          # + polars DataFrames
+uv add 'sluicebox[all]'             # all of the above, plus pandas
 ```
 
 | Extra | Adds | For |
@@ -61,12 +59,12 @@ uv add 'sluicebox[all] @ git+https://github.com/davidson-engineering/sluicebox' 
 | `polars`, `pandas` | polars / pandas | writing DataFrames, query results as DataFrames |
 | `all` | all of the above | |
 
-Append `@<tag-or-commit>` to the URL to pin a version. From a local checkout:
-`uv add '/path/to/sluicebox[v3]'`. Python 3.11+; `pip install` takes the same specifiers.
+Python 3.11+; `pip install` takes the same specifiers. The development version installs from
+GitHub: `uv add 'sluicebox[v3] @ git+https://github.com/davidson-engineering/sluicebox'`.
 
 ## Quick start
 
-`sluicebox.toml` (non-secret settings; full reference in [`sluicebox.example.toml`](sluicebox.example.toml)):
+`sluicebox.toml` (non-secret settings; full reference in [`sluicebox.example.toml`](https://github.com/davidson-engineering/sluicebox/blob/main/sluicebox.example.toml)):
 
 ```toml
 [connection]
@@ -573,4 +571,4 @@ tag matches the version, runs the unit tests, builds, and uploads to PyPI by tru
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT; see [LICENSE](https://github.com/davidson-engineering/sluicebox/blob/main/LICENSE).
