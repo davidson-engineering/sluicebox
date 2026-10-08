@@ -1,0 +1,4 @@
+[
+  {"name": "influxdb2", "listen": "0.0.0.0:28086", "upstream": "influxdb2:8086", "enabled": true},
+  {"name": "influxdb3", "listen": "0.0.0.0:28181", "upstream": "influxdb3:8181", "enabled": true}
+]

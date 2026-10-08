@@ -1,0 +1,115 @@
+# influxkit configuration reference (copy to influxkit.toml and adjust [connection]).
+# Every active value below is the default; only [connection] is required.
+#
+# Secrets do NOT belong here: put the token in the environment or a .env file
+#   INFLUXKIT_TOKEN=...            (or INFLUXKIT_TOKEN_FILE=/run/secrets/influx-token)
+# Any setting can also be overridden by an environment variable, e.g.
+#   INFLUXKIT_CONNECTION__URL=https://influx.internal:8181
+#   INFLUXKIT_WRITE__BATCH_SIZE=50000
+# INFLUXKIT_CONFIG=path/to/file.toml and INFLUXKIT_SECTION=prod pick the file and a table in it.
+# Durations accept "250ms", "30s", "1h30m"; sizes accept "8MiB", "512KB".
+
+name = "ingest"                     # label for metrics and logs
+
+[connection]
+url = "http://localhost:8181"       # InfluxDB 3 default port 8181, InfluxDB 2 uses 8086
+version = 3                         # 2 or 3
+database = "telemetry"              # database (v3) / bucket (v2); overridable per write()
+# org = "my-org"                    # required for InfluxDB 2
+timeout = "30s"                     # read timeout of one request
+connect_timeout = "5s"
+verify_ssl = true
+# ca_cert = "/etc/ssl/internal-ca.pem"
+# client_cert = "/etc/ssl/client.pem"   # mutual TLS
+# client_key = "/etc/ssl/client.key"
+# proxy = "http://proxy.internal:3128"  # credentials go in INFLUXKIT_CONNECTION__PROXY, not here
+# pool_size = 18                    # default: write.concurrency + 2
+
+[write]
+precision = "ns"                    # ns | us | ms | s (applies to integer timestamps)
+batch_size = 25000                  # lines per request
+max_batch_bytes = "8MiB"            # InfluxDB 3 rejects bodies over 10 MiB; learned lower after a 413
+flush_interval = "1s"               # send a partial batch once it is this old
+concurrency = 16                    # sender threads = requests in flight
+max_pending_bytes = "128MiB"        # buffered + in-flight data (RSS can grow ~3x this when full)
+on_full = "block"                   # block | drop (telemetry that must never stall) | raise
+block_timeout = "60s"               # with on_full = "block": raise BufferFullError after this long
+gzip = true
+gzip_level = 1
+gzip_min_bytes = "4KiB"
+auto_timestamp = true               # stamp points without a time at write(): retries never duplicate
+# api = "v3"                        # v3: /api/v3/write_lp (InfluxDB 3 Core/Enterprise, per-line errors)
+                                    # v2: /api/v2/write (InfluxDB 2, and InfluxDB 3 Cloud Serverless/Dedicated)
+no_sync = false                     # InfluxDB 3 write_lp: acknowledge before the WAL is persisted
+accept_partial = true               # InfluxDB 3 write_lp: keep valid lines when some are rejected
+flush_on_exit = true                # flush the buffer when the interpreter exits
+close_timeout = "20s"               # below Kubernetes' default 30 s termination grace period
+
+[write.retry]                       # transient failures: network errors, timeouts, 429, 5xx
+# max_attempts = 10                 # unlimited by default: max_elapsed bounds retrying
+initial_delay = "500ms"
+max_delay = "30s"
+multiplier = 2.0
+jitter = 0.2
+max_elapsed = "5m"                  # ride out outages this long (writers block once the buffer is full)
+retry_on_status = [429, 500, 502, 503, 504]
+
+[query]
+# language = "sql"                  # sql | influxql (InfluxDB 3), flux (InfluxDB 2)
+timeout = "2m"
+chunk_size = 10000                  # rows per chunk from query_stream() on InfluxDB 2
+
+[validation]
+on_invalid = "raise"                # raise | drop (skip the record, log + count it)
+type_lock = true                    # a field keeps the type it was first written with
+unknown_measurements = "allow"      # reject: only measurements declared below may be written
+coerce = true                       # int -> float, integral float -> int when the type demands it
+int_as_float = false                # write Python ints as floats unless declared integer
+non_finite = "skip"                 # NaN / inf fields: skip | error
+naive_datetime = "error"            # timezone-naive datetimes: error | utc
+max_string_bytes = "1MiB"
+raw_lines = "passthrough"           # line protocol input: passthrough | validate (also applies tags)
+
+# Declared schemas (optional): types are enforced, tags can be closed and required.
+# [measurements.cpu]
+# fields = { usage_user = "float", usage_system = "float", cores = "integer", healthy = "boolean" }
+# tags = ["host", "region", "env"]    # allowed tag keys (include injected tags)
+# required_tags = ["host"]
+# required_fields = ["usage_user"]
+# extra_fields = "forbid"             # allow | forbid
+
+[tags]
+on_conflict = "keep"                # keep the point's value | overwrite | error
+# static = { env = "production" }     # added to every point
+# from_env = { region = "AWS_REGION" }  # tag value from an environment variable (error if unset)
+
+# Content-aware rules (optional): when a point matches, add tags. Conditions: measurement
+# (regex), tags (regex per tag; named groups become template values), has_tags, missing_tags,
+# has_fields, fields (gt ge lt le eq ne in regex). Templates: {group}, {measurement},
+# {tags[key]}, {fields[key]}; a rule whose template references a missing value does not apply.
+# [[tags.rules]]
+# name = "site-from-device"
+# when.measurement = "^sensor_"
+# when.tags = { device = '^(?P<site>[a-z]+)-(?P<rack>\d+)$' }
+# set = { site = "{site}", rack = "{rack}" }
+#
+# [[tags.rules]]
+# name = "overheating"
+# when.fields = { temperature = { gt = 80 } }
+# set = { alert = "overheating" }
+
+[metrics]
+enabled = true
+namespace = "influxkit"
+# port = 9108                       # serve /metrics (once per process); omit if your app exports metrics
+
+[profiling]
+enabled = true                      # per-stage timings in metrics and client.stats()
+slow_batch_threshold = "5s"
+slow_query_threshold = "10s"
+
+[logging]
+configure = false                   # true: install a handler on the "influxkit" logger
+level = "INFO"
+format = "text"                     # text | json
+log_rejected_lines = 5

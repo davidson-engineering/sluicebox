@@ -1,0 +1,95 @@
+[project]
+name = "influxkit"
+version = "0.1.0"
+description = "High-throughput, validated and observable writes and queries for InfluxDB 2 and InfluxDB 3"
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["influxdb", "influxdb3", "timeseries", "line-protocol", "metrics", "prometheus"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dependencies = [
+    "prometheus-client>=0.17",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "urllib3>=2.0",
+]
+
+[project.optional-dependencies]
+# Query support wraps the official clients; writes never need them.
+v2 = ["influxdb-client>=1.40"]
+v3 = ["influxdb3-python>=0.12"]
+polars = ["polars>=1.0"]
+pandas = ["pandas>=2.0"]
+all = ["influxkit[v2,v3,polars,pandas]"]
+
+[dependency-groups]
+dev = [
+    "influxkit[all]",
+    "mypy>=1.13",
+    "pandas-stubs>=2.2",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pytest-httpserver>=1.1",
+    "pytest-timeout>=2.3",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.13"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["src", "tests", "benchmarks", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "PERF", "C4", "PIE", "PT", "RET", "TID", "TC", "ARG", "S"]
+ignore = [
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004", "PLW0603",
+    "PLC0415",  # optional dependencies (polars, pandas, pyarrow, official clients) are imported lazily
+    "S101",     # asserts are fine in tests and for type narrowing
+    "S311",     # random is used for retry jitter, not cryptography
+    "RUF022",   # __all__ is grouped by topic, not sorted
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ARG", "PLC0415", "SIM117", "E501"]  # literal test data reads better unwrapped
+"benchmarks/**" = ["S", "T201", "PLC0415"]
+"examples/**" = ["T201", "S"]
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel", "pydantic_settings.BaseSettings"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["src/influxkit"]
+
+[[tool.mypy.overrides]]
+# Optional, partially typed dependencies are treated as Any at the integration boundary.
+module = ["influxdb_client", "influxdb_client.*", "influxdb_client_3", "influxdb_client_3.*", "pyarrow", "pyarrow.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = ["integration: requires the docker compose InfluxDB servers (docker compose up -d --wait)"]
+timeout = 120
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["influxkit"]
+branch = true

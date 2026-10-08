@@ -1,0 +1,138 @@
+# Local InfluxDB 2 and InfluxDB 3 Core servers for development and integration tests.
+# Their credentials are random throwaway values generated into docker/secrets/ (git-ignored)
+# by the "secrets" service on the first `docker compose up`; tests/servers.py reads them there.
+#
+#   docker compose up -d --wait                          # the two servers
+#   docker/tls/generate.sh && \
+#   docker compose --profile network up -d --wait        # + TLS servers, Toxiproxy, nginx
+name: influxkit-dev
+
+x-influxdb2-env: &influxdb2-env
+  DOCKER_INFLUXDB_INIT_MODE: setup
+  DOCKER_INFLUXDB_INIT_USERNAME: influxkit
+  DOCKER_INFLUXDB_INIT_PASSWORD_FILE: /run/secrets/influxdb2-password
+  DOCKER_INFLUXDB_INIT_ORG: influxkit
+  DOCKER_INFLUXDB_INIT_BUCKET: influxkit
+  DOCKER_INFLUXDB_INIT_ADMIN_TOKEN_FILE: /run/secrets/influxdb2-token
+
+# Every server waits for the generated credentials.
+x-needs-secrets: &needs-secrets
+  secrets:
+    condition: service_completed_successfully
+
+services:
+  # One-shot: generates the credentials (keeps existing ones) and exits.
+  secrets:
+    image: influxdb:2.9.1   # any image with a shell; this one is pulled anyway
+    entrypoint: ["sh", "/dev-secrets.sh", "/secrets"]
+    volumes:
+      - ./docker/dev-secrets.sh:/dev-secrets.sh:ro
+      - ./docker/secrets:/secrets
+
+  influxdb2:
+    image: influxdb:2.9.1
+    ports:
+      - "18086:8086"
+    environment: *influxdb2-env
+    volumes:
+      - ./docker/secrets:/run/secrets:ro
+    depends_on: *needs-secrets
+    tmpfs:
+      - /var/lib/influxdb2
+      - /etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping", "--host", "http://localhost:8086"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  influxdb3:
+    image: influxdb:3.12.0-core
+    command:
+      - serve
+      - --node-id=influxkit-dev
+      - --object-store=memory
+      - --admin-token-file=/run/secrets/influxdb3-admin-token.json
+    ports:
+      - "18181:8181"
+    volumes:
+      - ./docker/secrets:/run/secrets:ro
+    depends_on: *needs-secrets
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -o /dev/null -H \"Authorization: Bearer $$(cat /run/secrets/influxdb3-token)\" http://localhost:8181/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # --- network profile: conditions a remote server brings --------------------------------
+
+  # TCP proxy that injects latency, bandwidth limits, resets and blackholes on demand.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: [network]
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    ports:
+      - "18474:8474"    # control API
+      - "28086:28086"   # -> influxdb2
+      - "28181:28181"   # -> influxdb3
+    volumes:
+      - ./docker/toxiproxy.json:/config/toxiproxy.json:ro
+    depends_on: [influxdb2, influxdb3]
+
+  # Reverse proxy: small request body limit (HTML 413 responses) and a mutual-TLS port.
+  nginx:
+    image: nginx:1.30.5-alpine
+    profiles: [network]
+    ports:
+      - "28087:8086"   # -> influxdb2 (256 KB body limit)
+      - "28182:8181"   # -> influxdb3 (256 KB body limit)
+      - "28443:8443"   # -> influxdb3 over mutual TLS (HTTP and gRPC)
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/tls:/etc/tls:ro
+    depends_on: [influxdb2, influxdb3]
+
+  # The same servers with native TLS (certificates from docker/tls/generate.sh).
+  influxdb2-tls:
+    image: influxdb:2.9.1
+    profiles: [network]
+    ports:
+      - "18087:8086"
+    environment:
+      <<: *influxdb2-env
+      INFLUXD_TLS_CERT: /etc/tls/server.crt
+      INFLUXD_TLS_KEY: /etc/tls/server.key
+    volumes:
+      - ./docker/tls:/etc/tls:ro
+      - ./docker/secrets:/run/secrets:ro
+    depends_on: *needs-secrets
+    tmpfs:
+      - /var/lib/influxdb2
+      - /etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping", "--host", "https://localhost:8086", "--skip-verify"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  influxdb3-tls:
+    image: influxdb:3.12.0-core
+    profiles: [network]
+    command:
+      - serve
+      - --node-id=influxkit-dev-tls
+      - --object-store=memory
+      - --admin-token-file=/run/secrets/influxdb3-admin-token.json
+      - --tls-cert=/etc/tls/server.crt
+      - --tls-key=/etc/tls/server.key
+    ports:
+      - "18182:8181"
+    volumes:
+      - ./docker/secrets:/run/secrets:ro
+      - ./docker/tls:/etc/tls:ro
+    depends_on: *needs-secrets
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sfk -o /dev/null -H \"Authorization: Bearer $$(cat /run/secrets/influxdb3-token)\" https://localhost:8181/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
