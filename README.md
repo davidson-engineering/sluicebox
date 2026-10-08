@@ -567,6 +567,10 @@ On first start the compose stack generates random throwaway credentials into `do
 (git-ignored), where the tests and benchmarks read them; the servers keep their data in memory.
 InfluxDB 3 Core allows five databases, so the tests share one.
 
+Releasing: set `version` in `pyproject.toml`, commit, and publish a GitHub release tagged
+`v<version>` (`gh release create v0.1.0 --generate-notes`). The release workflow checks that the
+tag matches the version, runs the unit tests, builds, and uploads to PyPI by trusted publishing.
+
 ## License
 
 MIT; see [LICENSE](LICENSE).
