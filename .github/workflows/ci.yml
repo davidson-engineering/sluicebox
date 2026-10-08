@@ -21,6 +21,7 @@ jobs:
       - run: uv run mypy
 
   unit:
+    name: unit (${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
