@@ -273,8 +273,9 @@ Some environment variables steer loading itself (they may also be in `.env`):
 | `SLUICEBOX_SECRETS_DIR` | The secrets directory |
 
 The token is a `pydantic.SecretStr`: never printed, logged or put in a repr. sluicebox refuses to
-load a TOML file that contains a token (in any table) or a proxy password, since that file is
-meant to be committed. Unknown keys in the TOML file, keyword overrides or prefixed `.env`
+load a TOML file that contains a token (at the top level or in a table such as `[connection]`;
+fields or tags named `token` are fine) or a proxy password, since that file is meant to be
+committed. Unknown keys in the TOML file, keyword overrides or prefixed `.env`
 entries are errors with a "did you mean" suggestion; unknown `SLUICEBOX_*` environment variables
 are logged with the setting they probably meant (`SLUICEBOX_DATABASE` -> `SLUICEBOX_CONNECTION__DATABASE`);
 other applications' `.env` entries are ignored. Invalid settings raise `ConfigurationError`

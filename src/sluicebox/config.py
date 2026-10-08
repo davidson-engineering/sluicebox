@@ -734,14 +734,22 @@ def _deep_merge(base: dict[str, Any], extra: Mapping[str, Any]) -> dict[str, Any
     return out
 
 
-def _secret_paths(data: Mapping[str, Any], prefix: str = "") -> list[str]:
-    """Dotted paths of secret keys anywhere in a TOML document (e.g. ``connection.token``)."""
+def _secret_paths(data: Mapping[str, Any]) -> list[str]:
+    """Dotted paths of secrets in a TOML document (e.g. ``token`` or ``connection.token``).
+
+    Only where a token could be meant as a setting: at the top level and directly inside a
+    top-level table. Deeper keys are user data, such as a field or static tag named "token".
+    """
     found = []
     for key, value in data.items():
-        if key.lower() in _SECRET_KEYS:
-            found.append(prefix + key)
-        elif isinstance(value, Mapping):
-            found += _secret_paths(value, f"{prefix}{key}.")
+        if isinstance(value, Mapping):
+            found += [
+                f"{key}.{inner}"
+                for inner, secret in value.items()
+                if inner.lower() in _SECRET_KEYS and not isinstance(secret, Mapping)
+            ]
+        elif key.lower() in _SECRET_KEYS:
+            found.append(key)
     return found
 
 
