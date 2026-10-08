@@ -6,7 +6,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
-import polars as pl
 import pytest
 
 from sluicebox import Point, ValidationError
@@ -15,6 +14,9 @@ from sluicebox._serializer import Serializer
 from sluicebox.config import MeasurementSchema, TagRule, TagsConfig, ValidationConfig
 from sluicebox.frames import to_line_chunks
 from sluicebox.tags import TagInjector, tag_context
+
+# polars publishes no free-threaded (3.14t) wheels; CI runs that build without it.
+pl = pytest.importorskip("polars")
 
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
 

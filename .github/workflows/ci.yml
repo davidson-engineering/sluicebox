@@ -25,14 +25,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13", "3.14", "3.14t"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          # polars publishes only abi3 wheels, which free-threaded Python cannot load (it would
+          # be compiled from source for an hour): test 3.14t without it.
+          - python: "3.14t"
+            skip: --no-install-package polars --no-install-package polars-runtime-32
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync --locked
-      - run: uv run pytest tests/unit
+      - run: uv sync --locked ${{ matrix.skip }}
+      - run: uv run --no-sync pytest tests/unit
 
   integration:
     runs-on: ubuntu-latest

@@ -7,6 +7,7 @@ import io
 import json
 import logging
 from datetime import UTC, datetime, timedelta, timezone
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -45,6 +46,10 @@ def client(
 def sample(registry: CollectorRegistry, name: str, **labels: str) -> float:
     value = registry.get_sample_value(name, labels)
     return 0.0 if value is None else value
+
+
+# polars publishes no free-threaded (3.14t) wheels; CI runs that build without it.
+requires_polars = pytest.mark.skipif(find_spec("polars") is None, reason="polars is not installed")
 
 
 class TestMetrics:
@@ -294,7 +299,6 @@ class TestQueryHelpers:
         result = QueryResult(records=[{"a": 1, "b": "x"}, {"a": 2, "c": True}], query="q", language="flux")
         assert len(result) == 2
         assert result.columns == ["a", "b", "c"]
-        assert result.to_polars().shape == (2, 3)
         assert result.to_pandas().shape == (2, 3)
         assert result.to_arrow().num_rows == 2
         assert list(result) == result.to_dicts()
@@ -305,9 +309,18 @@ class TestQueryHelpers:
         table = pa.table({"time": pa.array([0], pa.timestamp("ns", "UTC")), "v": [1.5]})
         result = QueryResult(table=table, query="q", language="sql")
         assert result.to_dicts() == [{"time": datetime(1970, 1, 1, tzinfo=UTC), "v": 1.5}]
-        assert result.to_polars()["v"].to_list() == [1.5]
         with pytest.raises(ValueError, match="exactly one"):
             QueryResult()
+
+    @requires_polars
+    def test_query_result_to_polars(self) -> None:
+        import pyarrow as pa
+
+        records = QueryResult(records=[{"a": 1, "b": "x"}, {"a": 2, "c": True}], query="q", language="flux")
+        assert records.to_polars().shape == (2, 3)
+        table = QueryResult(table=pa.table({"v": [1.5]}), query="q", language="sql")
+        assert table.to_polars()["v"].to_list() == [1.5]
+        assert QueryResult(records=[], query="q", language="flux").to_polars().shape == (0, 0)
 
 
 class TestUsability:
@@ -418,7 +431,6 @@ class TestUsability:
 class TestQueryUsability:
     def test_empty_influxdb2_result_converts(self) -> None:
         result = QueryResult(records=[], query="q", language="flux")
-        assert result.to_polars().shape == (0, 0)
         assert result.to_pandas().shape == (0, 0)
         assert result.to_arrow().num_rows == 0
 
