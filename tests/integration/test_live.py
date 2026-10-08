@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -218,6 +219,40 @@ def test_server_rejection_is_attributed_to_the_failing_call(make_live_client: An
         assert [r["v"] for r in rows(client, unique)] == [1, 2, 3]
     stats = client.stats().write
     assert stats.points_failed == 1
+
+
+def test_waiting_callers_share_requests(make_live_client: Any, unique: str) -> None:
+    """Many threads waiting on their own writes: requests carry many points, outcomes stay per call."""
+    client = make_live_client(
+        validation={"type_lock": False}, write={"flush_interval": 1.0, "concurrency": 2}
+    )
+    client.write({"measurement": unique, "fields": {"v": 0}, "time": ts(0)}).result(timeout=30)
+    threads_count, rounds, bad = 40, 3, (7, 1)  # one call writes a float to the integer field
+    outcomes: dict[tuple[int, int], BaseException | None] = {}
+
+    def caller(t: int) -> None:
+        for r in range(rounds):
+            i = 1 + t * rounds + r
+            record = {"measurement": unique, "fields": {"v": 0.5 if (t, r) == bad else i}, "time": ts(i)}
+            outcomes[t, r] = client.write(record).exception(timeout=60)
+
+    threads = [threading.Thread(target=caller, args=(t,)) for t in range(threads_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert isinstance(outcomes.pop(bad), PartialWriteError)
+    if client.settings.connection.version == 3:
+        # InfluxDB 3 names the rejected line: only the failing call fails.
+        assert set(outcomes.values()) == {None}
+    else:
+        # InfluxDB 2 reports only a count: the other calls in that request see the partial write.
+        assert all(error is None or isinstance(error, PartialWriteError) for error in outcomes.values())
+    total = 1 + threads_count * rounds
+    assert len(rows(client, unique)) == total - 1
+    stats = client.stats().write
+    assert (stats.points_written, stats.points_failed) == (total - 1, 1)
+    assert stats.batches_written + stats.batches_failed <= total // 4
 
 
 def test_wrong_token(make_live_client: Any, unique: str) -> None:

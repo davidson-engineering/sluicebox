@@ -173,8 +173,10 @@ future.add_done_callback(lambda f: ack_upstream() if f.exception() is None else 
 ```
 
 Waiting flushes the buffer, so a synchronous write returns as soon as the server answers rather
-than after `flush_interval`. `client.flush()` waits for everything written so far; `close()`
-(or leaving the `with` block, or interpreter exit) flushes before shutting down.
+than after `flush_interval`. While all senders are busy, the writes of everyone waiting queue up
+and leave together in the next request (up to `batch_size`), so many threads each waiting on
+their own writes still get batched requests. `client.flush()` waits for everything written so
+far; `close()` (or leaving the `with` block, or interpreter exit) flushes before shutting down.
 
 Data is serialized before `write()` returns, so the objects you passed can be reused immediately.
 
