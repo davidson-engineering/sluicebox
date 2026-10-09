@@ -14,7 +14,8 @@ InfluxDB 2 and 3 disagree on backslashes (verified against InfluxDB 2.9 and 3.12
   find their data again (tag/field keys and values with ``=`` are fine): rejected for v2.
 * InfluxDB 3 rejects tabs in names and tag values; neither can store a newline there.
 
-String field values escape ``"`` and ``\\`` identically on both.
+String field values escape ``"`` and ``\\`` identically on both, and may contain newlines
+(both servers store them): lines are split only on newlines outside string field values.
 """
 
 from __future__ import annotations
@@ -52,6 +53,8 @@ class Dialect:
     reserved_field_keys: frozenset[str]
     forbid_tag_field_overlap: bool
     measurement_specials: str
+    #: Matches one line from its start up to (not including) its terminating newline.
+    line_pattern: re.Pattern[str]
 
     @classmethod
     def for_version(cls, version: int) -> Dialect:
@@ -83,6 +86,34 @@ class Dialect:
         return None
 
     # -- parsing ---------------------------------------------------------------------------
+
+    def split_lines(self, text: str) -> list[str]:
+        """The lines of ``text`` without comments and blank lines (``\\n`` or ``\\r\\n`` endings).
+
+        Newlines inside string field values belong to the value, not line ends.
+        """
+        if '"' not in text or "\n" not in text:  # no string field value can hold a newline
+            if "\r" in text:
+                text = text.replace("\r\n", "\n")
+            return [line for line in text.split("\n") if line and line[0] != "#"]
+        lines = []
+        match = self.line_pattern.match
+        pos = 0
+        size = len(text)
+        while pos < size:
+            if text[pos] == "#":
+                end = text.find("\n", pos)
+                if end < 0:
+                    break
+            else:
+                found = match(text, pos)
+                assert found is not None  # the pattern also matches the empty string
+                end = found.end()
+                line = text[pos : end - 1] if text[end - 1 : end] == "\r" else text[pos:end]
+                if line:
+                    lines.append(line)
+            pos = end + 1
+        return lines
 
     def _unescape(self, text: str, specials: str) -> str:
         if "\\" not in text:
@@ -118,6 +149,19 @@ class Dialect:
         return n
 
 
+def _line_pattern(escape: str) -> re.Pattern[str]:
+    """One line of line protocol, given how a backslash escapes outside string field values.
+
+    Only the structure that decides where the line ends is matched: measurement and tags up to
+    the first unescaped space, then ``key=value`` fields whose quoted values may span newlines,
+    then the rest of the line. Malformed input falls back to ending at the next newline.
+    """
+    name = rf"(?:[^ \n\\]++|{escape}|\\)*+"
+    key = rf"(?:[^,= \n\\]++|{escape}|\\)*+"
+    value = r'(?:"(?:[^"\\]++|\\.)*+"|[^, \n]*+)'
+    return re.compile(rf"{name}(?: {key}={value}(?:,{key}={value})*+)?[^\n]*+", re.DOTALL)
+
+
 _V2 = Dialect(
     version=2,
     measurement_escapes=str.maketrans({",": "\\,", " ": "\\ ", "=": "\\="}),
@@ -126,6 +170,7 @@ _V2 = Dialect(
     reserved_field_keys=frozenset({"time"}),
     forbid_tag_field_overlap=False,
     measurement_specials=",= ",
+    line_pattern=_line_pattern(r"\\[,= ]"),  # other backslashes are literal
 )
 _V3 = Dialect(
     version=3,
@@ -135,6 +180,7 @@ _V3 = Dialect(
     reserved_field_keys=frozenset({"time"}),
     forbid_tag_field_overlap=True,
     measurement_specials=", ",
+    line_pattern=_line_pattern(r"\\[^\n]"),
 )
 
 

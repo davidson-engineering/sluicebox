@@ -285,6 +285,17 @@ def test_token_anywhere_in_the_toml_is_refused(tmp_path: Path) -> None:
         load_settings(path, env_file=None)
 
 
+def test_a_field_or_tag_named_token_is_not_a_secret(tmp_path: Path) -> None:
+    path = _minimal(
+        tmp_path,
+        '[tags.static]\ntoken = "abc"\n[measurements.llm.fields]\ntoken = "string"\n'
+        '[measurements.token]\nfields = { n = "integer" }\n',
+    )
+    settings = load_settings(path, env_file=None)
+    assert settings.tags.static == {"token": "abc"}
+    assert set(settings.measurements) == {"llm", "token"}
+
+
 def test_settings_with_overrides_merge_tables(tmp_path: Path) -> None:
     settings = load_settings(_minimal(tmp_path, "[write]\nbatch_size = 10\n"), env_file=None)
     merged = settings.with_overrides(write={"concurrency": 2})

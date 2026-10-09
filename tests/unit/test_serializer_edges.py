@@ -191,3 +191,21 @@ class TestMisc:
         warnings = [r for r in caplog.records if "distinct tag sets" in r.getMessage()]
         assert len(warnings) == 1
         assert "'req'" in warnings[0].getMessage()
+
+    def test_cardinality_warning_comes_after_the_documented_count(
+        self, caplog: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sluicebox._serializer as module
+
+        monkeypatch.setattr(module, "_TAGSET_CACHE_LIMIT", 10)  # the README's 150,000 becomes 30
+        caplog.set_level(logging.WARNING, logger="sluicebox.validation")
+
+        def warned_after(count: int) -> bool:
+            caplog.clear()
+            records = [
+                {"measurement": "req", "tags": {"id": str(i)}, "fields": {"v": 1.0}} for i in range(count)
+            ]
+            serialize(make(), *records)
+            return any("over 30 distinct tag sets" in r.getMessage() for r in caplog.records)
+
+        assert warned_after(31)

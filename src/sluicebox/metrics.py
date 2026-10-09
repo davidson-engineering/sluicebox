@@ -20,12 +20,16 @@ name                                                    type       labels
 ``write_batch_duration_seconds``                        histogram  client, database
 ``write_batch_points``                                  histogram  client
 ``write_buffer_bytes``                                  gauge      client
+``write_buffer_limit_bytes``                            gauge      client
+``write_max_batch_bytes``                               gauge      client
+``write_last_success_timestamp_seconds``                gauge      client
 ``write_inflight_requests``                             gauge      client
 ``queries_total``                                       counter    client, language, outcome
 ``query_duration_seconds``                              histogram  client, language
 ``query_rows_total``                                    counter    client, language
 ``errors_total``                                        counter    client, operation, error
 ``stage_duration_seconds``                              histogram  client, stage
+``client_info``                                         info       client, version, ...
 =====================================================  =========  ===========================
 """
 

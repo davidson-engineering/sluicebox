@@ -91,7 +91,6 @@ class TestLifecycle:
         fake.responder = lambda _: Reply(delay=3)
         client = client_for(write={"batch_size": 1, "concurrency": 8}, connection={"timeout": 10})
         futures = [client.write(points(1, start=i)) for i in range(8)]
-        client.flush_nowait = None  # type: ignore[attr-defined]
         time.sleep(0.2)  # all eight requests in flight
         started = time.monotonic()
         with pytest.raises(WriteError) as info:

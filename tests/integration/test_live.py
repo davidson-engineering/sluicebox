@@ -126,6 +126,28 @@ def test_tricky_values_round_trip(live_client: InfluxClient, unique: str) -> Non
     ]
 
 
+@pytest.mark.parametrize("raw_lines", ["passthrough", "validate"])
+def test_line_protocol_with_multiline_strings_replays(
+    make_live_client: Any, unique: str, raw_lines: str
+) -> None:
+    """to_line_protocol() output (what WriteFailure.lines holds) can be written back as is."""
+    client = make_live_client(write={"batch_size": 2}, validation={"raw_lines": raw_lines})
+    records = [
+        {"measurement": unique, "tags": {"t": "x"}, "fields": {"s": s, "i": i}, "time": ts(i)}
+        for i, s in enumerate(TRICKY_STRINGS)
+    ]
+    text = "\n".join(client.to_line_protocol(records))
+    assert client.write(text).result(timeout=30).points == len(records)
+    stored = rows(client, unique)
+    if client.settings.connection.version == 2:
+        for row in stored:  # see test_tricky_values_round_trip
+            if "s" in row:
+                row["s"] = row["s"].replace("\r\n", "\n")
+    assert [(r["time"], r.get("s", ""), r["i"]) for r in stored] == [
+        (rec["time"], rec["fields"]["s"], rec["fields"]["i"]) for rec in records
+    ]
+
+
 def test_special_measurement_and_keys(live_client: InfluxClient, unique: str) -> None:
     # "=" in measurement names is rejected for InfluxDB 2 (stored but never queryable there).
     name = f"{unique} m,x=y" if live_client.settings.connection.version == 3 else f"{unique} m,x"
@@ -307,6 +329,12 @@ def test_query_parameters_and_errors(live_client: InfluxClient, unique: str) -> 
         )
         result = live_client.query(flux, params={"bucket": V2_BUCKET, "host": "a"})
         assert [r["_value"] for r in result] == [0.0, 3.0]
+        # Flux wants imports first: the params option goes after them.
+        imported = live_client.query(
+            f'// comment\nimport "strings"\n{flux.replace("params.host", "strings.toLower(v: params.host)")}',
+            params={"bucket": V2_BUCKET, "host": "A"},
+        )
+        assert [r["_value"] for r in imported] == [0.0, 3.0]
         with pytest.raises(QueryError):
             live_client.query("from(bucket:")
 

@@ -60,7 +60,7 @@ _REQUIRED_KEYS = ("measurement", "fields")
 _ISO_FRACTION = re.compile(r"^(.*?[T ]\d{2}:\d{2}:\d{2})[.,](\d+)(.*)$", re.IGNORECASE)
 _FRAGMENT_CACHE_LIMIT = 200_000
 _TAGSET_CACHE_LIMIT = 50_000
-_TAGSET_CACHE_RESETS = 3
+_TAGSET_CACHE_FILLS = 3
 _NO_COERCION: Any = object()
 
 _isfinite = math.isfinite
@@ -92,7 +92,7 @@ class _Plan:
         "rules",
         "static_tagsets",
         "tag_keys",
-        "tagset_resets",
+        "tagset_fills",
         "tagsets",
         "types",
     )
@@ -111,7 +111,7 @@ class _Plan:
         self.tagsets: dict[tuple[tuple[str, Any], ...], str] | None = {}
         #: Same, keyed by the point's own tags when only (constant) static tags are injected.
         self.static_tagsets: dict[tuple[tuple[str, Any], ...], str] | None = {}
-        self.tagset_resets = 0
+        self.tagset_fills = 0
         self.rules = rules
         self.allowed_tags = schema.tags if schema else None
         self.required_tags = schema.required_tags if schema else frozenset()
@@ -178,7 +178,9 @@ class Serializer:
         stamp_hi = _INT64_MAX // divisor
         now = None
         if self.auto_timestamp:
-            now = (now_ns if now_ns is not None else time.time_ns()) // divisor
+            if now_ns is None:
+                now_ns = time.time_ns()
+            now = now_ns // divisor
         lines: list[str] = []
         append = lines.append
         nbytes = 0
@@ -229,7 +231,7 @@ class Serializer:
                     fields = record.fields
                     timestamp = record.timestamp
                 elif kind is str or kind is bytes:
-                    raw = self._raw_lines(record, database, precision, now_ns, index)
+                    raw = self._raw_lines(record, database, precision, now_ns, now, index)
                     for line in raw.lines:
                         append(line)
                     nbytes += raw.nbytes
@@ -348,7 +350,7 @@ class Serializer:
                 else:
                     line = f"{head} {','.join(out)} {self._timestamp(timestamp, divisor, measurement)}"
                 append(line)
-                nbytes += len(line) + 1
+                nbytes += (len(line) if line.isascii() else len(line.encode("utf-8"))) + 1
                 if journal:
                     journal.clear()
             except ValidationError as error:
@@ -504,9 +506,10 @@ class Serializer:
             assert cache is not None
             if len(cache) >= _TAGSET_CACHE_LIMIT:
                 # A full cache means many distinct tag sets. Allow a few refills (the working set
-                # may have moved on); after that the cardinality is too high to pay off.
-                plan.tagset_resets += 1
-                if plan.tagset_resets > _TAGSET_CACHE_RESETS:
+                # may have moved on); after _TAGSET_CACHE_FILLS fills the cardinality is too high
+                # to pay off.
+                plan.tagset_fills += 1
+                if plan.tagset_fills >= _TAGSET_CACHE_FILLS:
                     if static_cache:
                         plan.static_tagsets = None
                     else:
@@ -519,7 +522,7 @@ class Serializer:
                         "keeps an index of all series in memory). Store unbounded values such as "
                         "request ids, user ids or timestamps as fields, not tags",
                         plan.measurement,
-                        _TAGSET_CACHE_LIMIT * _TAGSET_CACHE_RESETS,
+                        _TAGSET_CACHE_LIMIT * _TAGSET_CACHE_FILLS,
                         extra={"influx": {"measurement": plan.measurement}},
                     )
                     return head
@@ -1049,7 +1052,13 @@ class Serializer:
         )
 
     def _raw_lines(
-        self, data: str | bytes, database: str, precision: str, now_ns: int | None, index: int
+        self,
+        data: str | bytes,
+        database: str,
+        precision: str,
+        now_ns: int | None,
+        now: int | None,
+        index: int,
     ) -> SerializedChunk:
         if type(data) is bytes:
             try:
@@ -1061,14 +1070,22 @@ class Serializer:
                 ) from None
         else:
             text = data  # type: ignore[assignment]
-        if "\n" in text or "\r" in text:
-            candidates = [line for line in text.replace("\r\n", "\n").split("\n") if line and line[0] != "#"]
-        elif text and text[0] != "#":
-            candidates = [text]
-        else:
+        candidates = self.dialect.split_lines(text)
+        if not candidates:
             return SerializedChunk([], 0, 0)
         if not self._validate_raw:
-            return SerializedChunk(candidates, sum(map(len, candidates)) + len(candidates), 0)
+            if now is not None:
+                # Untimed lines get the write() time too, so that a retry overwrites them.
+                stamp = f" {now}"
+                candidates = [
+                    line if line[line.rfind(" ") + 1 :].isdigit() else _with_timestamp(line, stamp)
+                    for line in candidates
+                ]
+            if text.isascii():
+                nbytes = sum(map(len, candidates))
+            else:
+                nbytes = sum(len(line.encode("utf-8")) for line in candidates)
+            return SerializedChunk(candidates, nbytes + len(candidates), 0)
         records = []
         for line in candidates:
             if not line.strip():
@@ -1090,6 +1107,19 @@ class Serializer:
         return self.serialize(
             records, database=database, precision=precision, start_index=index, now_ns=now_ns
         )
+
+
+def _with_timestamp(line: str, stamp: str) -> str:
+    """Raw ``line`` with ``stamp`` (a space and the time) appended unless it has a timestamp.
+
+    The timestamp is the last space-separated token: a field set always contains ``=``, and a
+    space inside a string field value is followed by its closing quote.
+    """
+    body = line.rstrip(" \t")
+    tail = body[body.rfind(" ") + 1 :]
+    if tail.isdigit() or (tail[:1] == "-" and tail[1:].isdigit()):
+        return line
+    return body + stamp
 
 
 def _written_keys(fields: Mapping[str, Any]) -> set[Any]:

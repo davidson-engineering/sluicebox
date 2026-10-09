@@ -130,10 +130,10 @@ Timestamps may be ints in the write precision, timezone-aware `datetime`s, ISO 8
 (nanoseconds kept), float epoch seconds, or numpy/pandas timestamps and integers. Values
 InfluxDB cannot store (before 1677 or after 2262) are rejected; integer timestamps that land
 before 1973 log a warning, since that is what epoch seconds written with `precision="ns"` look
-like. Points without a timestamp get the time of the `write()` call (`write.auto_timestamp`),
-which makes retries idempotent. Untimed points of the same series written in one call therefore
-share a timestamp and overwrite each other, as with server-assigned times; sluicebox logs a
-warning when that happens.
+like. Points without a timestamp (raw line protocol too) get the time of the `write()` call
+(`write.auto_timestamp`), which makes retries idempotent. Untimed points of the same series
+written in one call therefore share a timestamp and overwrite each other, as with server-assigned
+times; sluicebox logs a warning when that happens (except for raw lines passed through unparsed).
 
 DataFrames: a column named `time` (or a datetime column named `timestamp`, or a pandas
 `DatetimeIndex`) is the timestamp unless `time_column=` says otherwise; it may hold datetimes,
@@ -275,8 +275,9 @@ Some environment variables steer loading itself (they may also be in `.env`):
 | `SLUICEBOX_SECRETS_DIR` | The secrets directory |
 
 The token is a `pydantic.SecretStr`: never printed, logged or put in a repr. sluicebox refuses to
-load a TOML file that contains a token (in any table) or a proxy password, since that file is
-meant to be committed. Unknown keys in the TOML file, keyword overrides or prefixed `.env`
+load a TOML file that contains a token (at the top level or in a table such as `[connection]`;
+fields or tags named `token` are fine) or a proxy password, since that file is meant to be
+committed. Unknown keys in the TOML file, keyword overrides or prefixed `.env`
 entries are errors with a "did you mean" suggestion; unknown `SLUICEBOX_*` environment variables
 are logged with the setting they probably meant (`SLUICEBOX_DATABASE` -> `SLUICEBOX_CONNECTION__DATABASE`);
 other applications' `.env` entries are ignored. Invalid settings raise `ConfigurationError`
@@ -288,7 +289,7 @@ Every record is checked while it is serialized, before anything is buffered:
 
 | Check | Behaviour |
 | --- | --- |
-| Field type lock (`type_lock`) | The first type written for a field is kept; later values must match. Safe coercions apply (`coerce`): int to float, integral float to int. Booleans never become numbers. A record that is rejected locks nothing. |
+| Field type lock (`type_lock`) | The first type written for a field is kept; later values must match. Safe coercions apply (`coerce`): int to float, integral float to int. Booleans never become numbers. A record that is rejected locks nothing, nor does a DataFrame write in which no row is written. |
 | Server types | When the server rejects a value because it stores the field with another type, the lock follows the server's type. `client.sync_schema()` learns all stored types up front. |
 | Declared schemas | `[measurements.<name>]`: field types, allowed and required tags, required fields, `extra_fields = "forbid"`. `unknown_measurements = "reject"` allows only declared measurements. |
 | Identifiers | Escaped per server version; names that cannot round-trip are rejected (trailing backslash, control characters, reserved keys, `#`-prefixed measurements, `=` in InfluxDB 2 measurement names, tag/field name clashes on InfluxDB 3). |
@@ -308,8 +309,11 @@ Codes: `type_conflict`, `non_finite`, `out_of_range`, `string_too_long`, `invali
 `naive_datetime`, `malformed_record`, `unsupported_type`, `unsupported_record`, `invalid_line`,
 `invalid_encoding`.
 
-Raw line protocol is passed through unchanged by default (fastest); `raw_lines = "validate"`
-parses it so validation and tag injection apply too.
+Raw line protocol is passed through unchanged by default (fastest), except that lines without a
+timestamp get the `write()` time like any other point; `raw_lines = "validate"` parses it so
+validation and tag injection apply too. Either way, a newline inside a quoted string field value
+belongs to the value, so the output of `to_line_protocol()` and `WriteFailure.lines` can be
+written back as is.
 
 ```toml
 [validation]
@@ -375,8 +379,8 @@ for chunk in client.query_stream("SELECT * FROM big_table"):  # bounded memory
 
 Prefer `params` to string formatting. On InfluxDB 3, datetime parameters are sent as RFC 3339
 strings. On InfluxDB 2, Flux parameters are bound as escaped literals in an `option params = {...}`
-record, so `params.name` works on InfluxDB OSS too (the official client relies on a Cloud-only
-API feature); pass datetimes for Flux times. Writes are asynchronous: `flush()` before querying
+record (placed after the query's `import` statements), so `params.name` works on InfluxDB OSS
+too (the official client relies on a Cloud-only API feature); pass datetimes for Flux times. Writes are asynchronous: `flush()` before querying
 data you just wrote.
 
 Results: InfluxDB 3 timestamp columns are timezone-aware (UTC). InfluxDB 2 results come from the
