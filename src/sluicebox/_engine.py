@@ -7,7 +7,8 @@
   ``flush_interval`` old;
 * lets ``concurrency`` sender threads gzip and POST sealed batches over a keep-alive
   connection pool, retrying transient failures with backoff and splitting batches the
-  server rejects as too large (HTTP 413);
+  server rejects as too large (HTTP 413); a sender takes queued batches of the same
+  database and precision along in one request while the size limits allow;
 * bounds memory with ``max_pending_bytes`` (block / drop / raise when full);
 * resolves each ``write()`` call's :class:`~sluicebox.futures.WriteFuture`, attributing
   per-line partial-write errors to the exact call (and line) that produced them.
@@ -136,7 +137,7 @@ class _Batch:
         "nbytes",
         "precision",
         "sealed",
-        "seq",
+        "seqs",
         "serialize_time",
         "waiters",
     )
@@ -152,7 +153,8 @@ class _Batch:
         self.waiters: list[tuple[WriteFuture, int, int, int]] = []
         self.created = time.monotonic()
         self.sealed = 0.0
-        self.seq = 0
+        #: Sequence numbers in ``_outstanding``: one per sealed batch merged into this one.
+        self.seqs: list[int] = []
         #: Set (with the engine lock) by whoever reports the outcome: the sender, or close()
         #: when it gives up on a request that is still in flight.
         self.finished = False
@@ -304,6 +306,9 @@ class WriteEngine:
         self._stop = threading.Event()
         self._open: dict[tuple[str, str], _Batch] = {}
         self._queue: deque[_Batch] = deque()
+        #: Queued batches per (database, precision), so a sender only looks for batches to
+        #: take along when there are any.
+        self._queued: dict[tuple[str, str], int] = {}
         self._outstanding: set[int] = set()
         self._seq = 0
         self._sending: set[_Batch] = set()
@@ -489,10 +494,11 @@ class WriteEngine:
             del self._open[key]
         self._metrics.buffer(self._pending_bytes)
         self._seq += 1
-        batch.seq = self._seq
+        batch.seqs.append(self._seq)
         batch.sealed = time.monotonic()
-        self._outstanding.add(batch.seq)
+        self._outstanding.add(self._seq)
         self._queue.append(batch)
+        self._queued[key] = self._queued.get(key, 0) + 1
         self._has_work.notify()
 
     def _seal_all_open(self) -> None:
@@ -612,7 +618,7 @@ class WriteEngine:
                     if self._closed:
                         return
                     self._has_work.wait()
-                batch = self._queue.popleft()
+                batch = self._take()
                 self._sending.add(batch)
                 inflight = len(self._sending)
             self._metrics.inflight(inflight)
@@ -624,6 +630,53 @@ class WriteEngine:
                 outcome = _Outcome(failures=[_Failure(0, len(batch.lines), exc)])
             finally:
                 self._finish(batch, outcome)
+
+    def _take(self) -> _Batch:
+        """Dequeue the next batch to send (lock held, queue not empty).
+
+        Later queued batches of the same database and precision join it, in order, while
+        ``batch_size`` and ``max_batch_bytes`` allow. Small batches pile up in the queue when
+        callers wait on their writes, since every wait seals the open batch so that an idle
+        client answers at once; sent one per request, they would limit throughput to
+        ``concurrency`` points per server round trip.
+        """
+        batch = self._queue.popleft()
+        key = (batch.database, batch.precision)
+        others = self._queued[key] - 1
+        if others and len(batch.lines) < self._batch_size and batch.nbytes < self._max_batch_bytes:
+            skipped: list[_Batch] = []
+            while others:
+                other = self._queue.popleft()
+                if (other.database, other.precision) != key:
+                    skipped.append(other)
+                    continue
+                if (
+                    len(batch.lines) + len(other.lines) > self._batch_size
+                    or batch.nbytes + other.nbytes > self._max_batch_bytes
+                ):
+                    skipped.append(other)  # later ones stay behind it, keeping the order of writes
+                    break
+                self._merge(batch, other)
+                others -= 1
+            self._queue.extendleft(reversed(skipped))
+        if others:
+            self._queued[key] = others
+        else:
+            del self._queued[key]
+        return batch
+
+    @staticmethod
+    def _merge(batch: _Batch, other: _Batch) -> None:
+        """Append the lines of ``other`` (and all its bookkeeping) to ``batch``."""
+        base = len(batch.lines)
+        batch.waiters += [
+            (future, base + start, count, offset) for future, start, count, offset in other.waiters
+        ]
+        batch.lines += other.lines
+        batch.nbytes += other.nbytes
+        batch.serialize_time += other.serialize_time
+        batch.created = min(batch.created, other.created)
+        batch.seqs += other.seqs
 
     # ------------------------------------------------------------------------------------
     # Sending
@@ -842,7 +895,7 @@ class WriteEngine:
             with self._lock:
                 self._sending.discard(batch)
                 self._pending_bytes -= batch.nbytes
-                self._outstanding.discard(batch.seq)
+                self._outstanding.difference_update(batch.seqs)
                 self._points_written += written
                 self._points_failed += failed_lines
                 self._retries += outcome.retries
@@ -972,6 +1025,7 @@ class WriteEngine:
             self._seal_all_open()  # nothing can be opened after _closing; this is a safety net
             abandoned = list(self._queue)
             self._queue.clear()
+            self._queued.clear()
             # Requests still in flight are given up on as well (their senders' late results are
             # ignored), so every buffered point is accounted for when close() returns.
             stuck = [batch for batch in self._sending if not batch.finished]
