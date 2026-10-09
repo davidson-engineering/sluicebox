@@ -36,11 +36,19 @@ class Reply:
 Responder = Callable[[Recorded], Reply]
 
 
+class _QuickStopServer(HTTPServer):
+    """``stop()`` waits for the serve loop's next poll, 0.5 s apart by default."""
+
+    def thread_target(self) -> None:
+        assert self.server is not None
+        self.server.serve_forever(poll_interval=0.01)
+
+
 class FakeInflux:
     """Records every request (gunzipping bodies) and answers via ``responder``."""
 
     def __init__(self) -> None:
-        self.server = HTTPServer(threaded=True)
+        self.server = _QuickStopServer(threaded=True)
         self.server.expect_request(re.compile(".*")).respond_with_handler(self._handle)
         self.server.start()
         self.requests: list[Recorded] = []
