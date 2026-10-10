@@ -263,7 +263,9 @@ def test_outage_then_recovery(
 ) -> None:
     proxy = proxy_name(server_version)
     client = proxied(write={"retry": {"max_attempts": 30, "initial_delay": 0.1, "max_delay": 0.5}})
-    client.write(points(unique, 10)).result(timeout=30)  # warm the connection pool
+    # Warm the connection pool in another table: overwriting rows of the counted one can make
+    # InfluxDB 3 briefly count them twice.
+    client.write(points(f"{unique}_warmup", 10)).result(timeout=30)
     toxiproxy.enable(proxy, False)
     threading.Timer(2.0, toxiproxy.enable, (proxy, True)).start()
     n = 10_000
