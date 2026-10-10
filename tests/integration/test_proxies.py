@@ -169,7 +169,7 @@ def forward_proxy() -> Iterator[Any]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ForwardProxy)
     server.daemon_threads = True
     server.requests_seen = []  # type: ignore[attr-defined]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     yield server
     server.shutdown()
