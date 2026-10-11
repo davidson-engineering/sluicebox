@@ -263,6 +263,9 @@ class InfluxClient:
         if tags:
             with tag_context(**tags):
                 return self._write(data, target, prec, measurement, tag_columns, field_columns, time_column)
+        kind = type(data)
+        if (kind is dict or kind is Point) and measurement is None:
+            return self._write_one(data, target, prec)  # the most common call: one record
         return self._write(data, target, prec, measurement, tag_columns, field_columns, time_column)
 
     def _write(
@@ -291,13 +294,16 @@ class InfluxClient:
             raise
         elapsed = time.perf_counter() - started
         future = WriteFuture(self._engine)
-        future.dropped = chunk.dropped
-        future.rejected = chunk.rejected
-        if chunk.lines and not self._engine.submit(
-            database, precision, chunk.lines, chunk.nbytes, future, serialize_time=elapsed
+        if chunk.dropped:
+            future.dropped = chunk.dropped
+            future.rejected = chunk.rejected
+        if not chunk.lines:
+            future._seal()
+        elif not self._engine.submit(
+            database, precision, chunk.lines, chunk.nbytes, future, serialize_time=elapsed, seal=True
         ):
             future.dropped += len(chunk.lines)
-        future._seal()
+            future._seal()
         return future
 
     def _chunks(
@@ -798,7 +804,7 @@ def _shorten(text: str, limit: int = 300) -> str:
 def _add_dropped(future: WriteFuture, chunk: SerializedChunk) -> None:
     future.dropped += chunk.dropped
     if chunk.rejected and len(future.rejected) < MAX_REJECTED:
-        future.rejected += chunk.rejected[: MAX_REJECTED - len(future.rejected)]
+        future.rejected = [*future.rejected, *chunk.rejected[: MAX_REJECTED - len(future.rejected)]]
 
 
 _TAG_SETTINGS = frozenset({"static", "from_env", "rules", "on_conflict"})

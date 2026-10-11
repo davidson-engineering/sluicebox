@@ -130,16 +130,18 @@ class EngineStats:
 
 class _Batch:
     __slots__ = (
+        "counts",
         "created",
         "database",
         "finished",
+        "futures",
         "lines",
         "nbytes",
+        "offsets",
         "precision",
         "sealed",
         "seqs",
         "serialize_time",
-        "waiters",
     )
 
     def __init__(self, database: str, precision: str) -> None:
@@ -149,8 +151,13 @@ class _Batch:
         self.nbytes = 0
         #: Caller-thread time spent serializing the lines of this batch (recorded once per batch).
         self.serialize_time = 0.0
-        #: (future, first line index in this batch, line count, offset within the future's lines)
-        self.waiters: list[tuple[WriteFuture, int, int, int]] = []
+        #: The futures of the write() calls with lines here, in line order: each call's lines
+        #: follow the previous call's. ``counts`` holds how many lines each has in this batch,
+        #: ``offsets`` how many of its lines earlier batches carry. (Three lists rather than a
+        #: tuple per call: no object per buffered write for the garbage collector to scan.)
+        self.futures: list[WriteFuture] = []
+        self.counts: list[int] = []
+        self.offsets: list[int] = []
         self.created = time.monotonic()
         self.sealed = 0.0
         #: Sequence numbers in ``_outstanding``: one per sealed batch merged into this one.
@@ -346,13 +353,18 @@ class WriteEngine:
         *,
         block: bool = True,
         serialize_time: float = 0.0,
+        seal: bool = False,
     ) -> bool:
         """Buffer ``lines`` for ``future``. Returns False if they were dropped (buffer full).
 
         With ``block=False`` a full buffer under the ``block`` policy raises :class:`WouldBlock`
         (nothing is buffered) so asyncio callers can wait elsewhere via :meth:`wait_for_space`.
+        ``seal=True`` marks these as the last lines of the call, sealing the future with them
+        (the caller seals it on a False return or an exception).
         """
         if not lines:
+            if seal:
+                future._seal()
             return True
         with self._lock:
             if self._closing:
@@ -389,16 +401,12 @@ class WriteEngine:
             if count > self._batch_size or nbytes > self._max_batch_bytes:
                 # Lines are re-measured there: count exactly what the batches hold, since
                 # _finish releases batch.nbytes.
-                self._pending_bytes += self._submit_split(key, lines, future)
+                self._pending_bytes += self._submit_split(key, lines, future, seal)
             else:
                 self._pending_bytes += nbytes
                 if batch is None:
                     batch = self._new_open_batch(key)
-                batch.waiters.append((future, len(batch.lines), count, future.points))
-                future._attach()
-                future.points += count
-                batch.lines += lines
-                batch.nbytes += nbytes
+                self._fill(batch, lines, nbytes, future, seal)
                 batch.serialize_time += serialize_time
                 if len(batch.lines) >= self._batch_size or batch.nbytes >= self._max_batch_bytes:
                     self._seal(key, batch)
@@ -410,7 +418,7 @@ class WriteEngine:
             self._flusher_wake.notify()
         return batch
 
-    def _submit_split(self, key: tuple[str, str], lines: list[str], future: WriteFuture) -> int:
+    def _submit_split(self, key: tuple[str, str], lines: list[str], future: WriteFuture, seal: bool) -> int:
         """Cut an oversized submission into batches that respect both size limits.
 
         Returns the bytes added to batches (UTF-8, newlines included).
@@ -431,15 +439,17 @@ class WriteEngine:
             total += size
         if piece:
             batch = self._new_open_batch(key)
-            self._fill(batch, piece, piece_bytes, future)
+            self._fill(batch, piece, piece_bytes, future, seal)
             if len(batch.lines) >= self._batch_size or batch.nbytes >= self._max_batch_bytes:
                 self._seal(key, batch)
         return total
 
     @staticmethod
-    def _fill(batch: _Batch, lines: list[str], nbytes: int, future: WriteFuture) -> None:
-        batch.waiters.append((future, len(batch.lines), len(lines), future.points))
-        future._attach()
+    def _fill(batch: _Batch, lines: list[str], nbytes: int, future: WriteFuture, seal: bool = False) -> None:
+        batch.futures.append(future)
+        batch.counts.append(len(lines))
+        batch.offsets.append(future.points)
+        future._attach(seal)
         future.points += len(lines)
         batch.lines += lines
         batch.nbytes += nbytes
@@ -670,10 +680,9 @@ class WriteEngine:
     @staticmethod
     def _merge(batch: _Batch, other: _Batch) -> None:
         """Append the lines of ``other`` (and all its bookkeeping) to ``batch``."""
-        base = len(batch.lines)
-        batch.waiters += [
-            (future, base + start, count, offset) for future, start, count, offset in other.waiters
-        ]
+        batch.futures += other.futures
+        batch.counts += other.counts
+        batch.offsets += other.offsets
         batch.lines += other.lines
         batch.nbytes += other.nbytes
         batch.serialize_time += other.serialize_time
@@ -866,7 +875,8 @@ class WriteEngine:
         total = len(batch.lines)
         failed_lines = min(total, sum(failure.failed for failure in outcome.failures))
         written = total - failed_lines
-        elapsed = time.monotonic() - batch.created
+        finished = time.monotonic()
+        elapsed = finished - batch.created
         raw_bytes = batch.nbytes
         try:
             try:
@@ -874,17 +884,19 @@ class WriteEngine:
             except Exception:
                 log.exception("error while recording the metrics of a write batch")
             if not outcome.failures:
-                for future, _start, _count, _offset in batch.waiters:
-                    future._batch_done(None)
+                for future in batch.futures:
+                    future._batch_done(None, finished)
             else:
                 handled = self._report(batch, outcome, failed_lines)
                 self._learn_types(batch, outcome.failures)
                 affected = []
-                for future, start, count, offset in batch.waiters:
+                start = 0
+                for future, count, offset in zip(batch.futures, batch.counts, batch.offsets, strict=True):
                     error = self._future_error(batch.lines, outcome.failures, start, count, offset)
+                    start += count
                     if error is not None:
                         affected.append(future)
-                    future._batch_done(error)
+                    future._batch_done(error, finished)
                 if not handled:
                     unreported = _Unreported(outcome.failures[0].error, failed_lines, tuple(affected))
         finally:
@@ -1140,9 +1152,10 @@ class WriteEngine:
         self._init_state()
         self._transport.reset_after_fork()
         error = ClientClosedError("buffered in the parent process before fork(); the parent sends it")
+        now = time.monotonic()
         for batch in inherited:
-            for future, _start, _count, _offset in batch.waiters:
-                future._batch_done(error)
+            for future in batch.futures:
+                future._batch_done(error, now)
 
 
 # Locks held across fork(): the engines' (in a fixed order), then the futures lock, which

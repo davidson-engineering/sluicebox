@@ -22,7 +22,7 @@ from .exceptions import InfluxTimeoutError, PartialWriteError, ValidationError
 from .log import RateLimitedLog
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Sequence
 
     from ._engine import WriteEngine
 
@@ -81,12 +81,14 @@ class WriteFuture:
         #: Records dropped before sending.
         self.dropped = 0
         #: Validation errors of the dropped records (capped at ``MAX_REJECTED``).
-        self.rejected: list[ValidationError] = []
+        self.rejected: Sequence[ValidationError] = ()
         self._pending = 0  # batches carrying our lines that have not completed
         self._sealed = False  # all of our lines have been handed over
         self._done = False
         self._observed = False  # the outcome was retrieved (flush/close then skip its failures)
-        self._errors: list[BaseException] = []
+        # A list only once there is an error: buffered writes keep their futures alive, and
+        # every object they hold is more work for the cyclic garbage collector.
+        self._errors: Sequence[BaseException] = ()
         self._event: threading.Event | None = None
         self._callbacks: list[Callable[[WriteFuture], Any]] | None = None
         self._started_at = time.monotonic()
@@ -94,20 +96,27 @@ class WriteFuture:
 
     # -- engine side ------------------------------------------------------------------------
 
-    def _attach(self) -> None:
-        """A batch now carries some of our lines (called with the engine lock held)."""
+    def _attach(self, seal: bool = False) -> None:
+        """A batch now carries some of our lines (called with the engine lock held).
+
+        ``seal``: they are the last lines of this call. Unlike :meth:`_seal`, this cannot
+        complete the future: the batch that carries them has not been sent yet.
+        """
         with _LOCK:
             self._pending += 1
+            if seal:
+                self._sealed = True
 
-    def _batch_done(self, error: BaseException | None) -> None:
+    def _batch_done(self, error: BaseException | None, now: float) -> None:
+        """A batch carrying our lines completed at ``now`` (``time.monotonic()``)."""
         with _LOCK:
             if error is not None:
-                self._errors.append(error)
+                self._errors = [*self._errors, error]
             self._pending -= 1
             finished = self._sealed and self._pending == 0 and not self._done
             if finished:
                 self._done = True
-                self._finished_at = time.monotonic()
+                self._finished_at = now
         if finished:
             self._complete()
 
@@ -315,6 +324,6 @@ def completed_future(points: int = 0, dropped: int = 0, error: BaseException | N
     future.points = points
     future.dropped = dropped
     if error is not None:
-        future._errors.append(error)
+        future._errors = [error]
     future._seal()
     return future
