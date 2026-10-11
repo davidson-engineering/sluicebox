@@ -214,13 +214,11 @@ keeps its limit: 50,000 tag sets per measurement, 200,000 tag fragments).
 
 1. **Scale writes across threads on free-threaded Python.** Done: see "Writes from many
    threads on free-threaded Python" above.
-2. **Isolate bad lines on InfluxDB 2.** A line the server cannot parse fails its whole request
-   with HTTP 400, taking other callers' points with it, and replaying the `WriteFailure`
-   fails again. Client validation prevents this for records, but raw line protocol passes
-   through unchecked by default. Splitting such a batch in halves (as for HTTP 413) would
-   write every valid line and report only the bad ones.
-3. **A keep-alive fake server for the unit tests**, so they exercise connection reuse and
-   cannot run out of ports (see above).
+2. **Isolate bad lines on InfluxDB 2.** Done: the client takes out the lines InfluxDB 2
+   quotes and sends the rest again (halving when the quotes do not match), does the same on
+   InfluxDB 3's `/api/v2/write`, and rejects at `write()` lines the server would read into
+   the next.
+3. **A keep-alive fake server for the unit tests.** Done.
 4. A polars `UInt64` column with `int_as_float` is written as unsigned integers, while the row
    path writes the same values as floats: harmless (type locks catch the mix), but
    inconsistent.
