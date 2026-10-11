@@ -274,7 +274,12 @@ def test_waiting_callers_share_requests(make_live_client: Any, unique: str) -> N
     assert len(rows(client, unique)) == total - 1
     stats = client.stats().write
     assert (stats.points_written, stats.points_failed) == (total - 1, 1)
-    assert stats.batches_written + stats.batches_failed <= total // 4
+    if client.settings.connection.version == 3:
+        # Each request waits for a WAL flush (~1 s), so both senders stay busy and queued writes
+        # must share requests. InfluxDB 2 answers in milliseconds: how many writes queue up
+        # meanwhile depends on thread scheduling (12 requests here, 33-43 on CI runners), so
+        # request sharing is checked against a slow fake server in test_engine_coalescing.
+        assert stats.batches_written + stats.batches_failed <= total // 4
 
 
 def test_wrong_token(make_live_client: Any, unique: str) -> None:

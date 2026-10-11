@@ -211,6 +211,15 @@ class TestFailures:
         accepted = [line for r in fake.write_requests if len(r.lines) <= 2 for line in r.lines]
         assert sorted(accepted) == sorted(f'm s="{pad}" {i}' for i in range(7))
 
+    def test_413s_of_requests_sized_under_an_older_limit_teach_nothing(self, client_for: Any) -> None:
+        engine = client_for(write={"max_batch_bytes": 100_000})._engine
+        engine._learn_size_limit(80_000)  # built under the configured limit: learn
+        assert engine._max_batch_bytes == 40_000
+        engine._learn_size_limit(79_000)  # was in flight meanwhile: already below the limit
+        assert engine._max_batch_bytes == 40_000
+        engine._learn_size_limit(39_000)  # built under the learned limit: learn again
+        assert engine._max_batch_bytes == 19_500
+
     def test_413_for_tiny_requests_is_not_split_further(self, fake: FakeInflux, client_for: Any) -> None:
         fake.responder = lambda _: Reply(413, {"code": "request too large", "message": "max"})
         client = client_for()
