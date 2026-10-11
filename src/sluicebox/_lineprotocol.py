@@ -18,6 +18,8 @@ InfluxDB 2 and 3 disagree on backslashes (verified against InfluxDB 2.9 and 3.12
 
 String field values escape ``"`` and ``\\`` identically on both, and may contain newlines
 (both servers store them): lines are split only on newlines outside string field values.
+InfluxDB 2 reads a line that leaves a string value open, or ends in a backslash, together with
+the next line (see :func:`influxdb2_runs_on`), and may store the two as one point.
 """
 
 from __future__ import annotations
@@ -26,11 +28,16 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-__all__ = ["Dialect", "ParsedLine", "UInt", "parse_line"]
+__all__ = ["Dialect", "ParsedLine", "UInt", "influxdb2_runs_on", "parse_line"]
 
 #: Control characters, and unpaired surrogates (a Python str may hold them; UTF-8 cannot).
 _UNWRITABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
 STRING_ESCAPES = str.maketrans({'"': '\\"', "\\": "\\\\"})
+# What InfluxDB 2's line splitting looks at, outside and inside a string field value.
+_SPLIT_SPECIALS = re.compile(r'[\\ =,"]')
+_STRING_SPECIALS = re.compile(r'[\\"]')
+_LEFT_OPEN = "a string value is left open, so InfluxDB 2 reads the next line into it"
+_ESCAPED_END = "a backslash at the end escapes the line break, so InfluxDB 2 reads the next line into it"
 
 
 class UInt(int):
@@ -308,6 +315,45 @@ def parse_line(dialect: Dialect, line: str) -> ParsedLine:
         except ValueError:
             raise LineSyntaxError(f"invalid timestamp {rest[:40]!r}") from None
     return ParsedLine(measurement, tags, fields, timestamp)
+
+
+def influxdb2_runs_on(line: str) -> str | None:
+    """Why InfluxDB 2 would read the line after ``line`` in a request into it, or None.
+
+    It ends a line at a newline unless the newline is inside a string field value or escaped:
+    a backslash escapes whatever follows it (models.scanLine). A string value starts at a
+    quote after the first space, when more ``=`` than ``,`` have come since. A line leaving one
+    open, or ending in a backslash, runs on into the next line, so the server parses (and may
+    store) the two as one: a later line can close the value and swallow the lines between.
+    """
+    if '"' not in line and "\\" not in line:
+        return None
+    last = len(line) - 1
+    i = 0
+    fields = quoted = False
+    equals = commas = 0
+    while True:
+        found = (_STRING_SPECIALS if quoted else _SPLIT_SPECIALS).search(line, i)
+        if found is None:
+            return _LEFT_OPEN if quoted else None
+        i = found.start()
+        char = line[i]
+        if char == "\\":
+            if i == last:
+                return _ESCAPED_END
+            i += 2
+            continue
+        if char == " ":
+            fields = True
+        elif fields and char == '"':
+            if equals > commas:
+                quoted = not quoted
+        elif fields and not quoted:
+            if char == "=":
+                equals += 1
+            elif char == ",":
+                commas += 1
+        i += 1
 
 
 def _split_escaped(dialect: Dialect, text: str, sep: str) -> list[str]:
