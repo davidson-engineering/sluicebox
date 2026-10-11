@@ -184,6 +184,16 @@ Done-callbacks and `on_error` handlers run on the client's sender threads: they 
 the same client (`flush()`, `close()`, or `result()` of a pending write raise `RuntimeError`
 there), and should hand slow work to another thread.
 
+### Writing the same point twice
+
+Requests are sent in parallel (`write.concurrency`, 16) and retried independently, so batches can
+reach the server in a different order than they were written. Lines within one request keep
+their order. This matters only when the same point (series, field and timestamp) is written more
+than once with different values, for example a correction, or a "latest state" kept at a fixed
+timestamp: the older value may be stored last. For such writes, wait for the first write's future
+before sending the next, or set `write.concurrency = 1`, which sends one request at a time in
+order, retries included.
+
 ### Failures in the background
 
 A batch that still fails after retries (or that the server rejects) is reported:
