@@ -273,13 +273,18 @@ class TestAsync:
             async with AsyncInfluxClient(settings, registry=CollectorRegistry()) as client:
                 for i in range(40):
                     await client.write(
-                        [{"measurement": "m", "fields": {"v": float(j)}} for j in range(i * 5, i * 5 + 5)]
+                        [
+                            {"measurement": "m", "fields": {"v": float(j)}, "time": j + 1}
+                            for j in range(i * 5, i * 5 + 5)
+                        ]
                     )
                 await client.flush()
             task.cancel()
             return ticks
 
         assert asyncio.run(scenario()) > 5  # the loop kept running while writers waited for space
+        # Each write that waited for space was buffered once, after the wait.
+        assert sorted(fake.lines) == sorted(f"m v={float(j)} {j + 1}" for j in range(200))
 
 
 class TestQueryHelpers:

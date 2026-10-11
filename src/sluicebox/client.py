@@ -275,15 +275,31 @@ class InfluxClient:
         field_columns: Sequence[str] | None,
         time_column: str | None,
     ) -> WriteFuture:
-        if measurement is None and tag_columns is None and field_columns is None and time_column is None:
-            # The common calls: a record, or a list that fits in one batch.
-            kind = type(data)
-            if kind is dict or kind is Point:
-                return self._write_records((data,), database, precision)
-            if (kind is list or kind is tuple) and len(data) <= self._chunk_size:
-                return self._write_records(data, database, precision)
+        records = self._one_batch(data, measurement, tag_columns, field_columns, time_column)
+        if records is not None:
+            return self._write_records(records, database, precision)
         chunks = self._chunks(data, database, precision, measurement, tag_columns, field_columns, time_column)
         return self._submit(chunks, database, precision)
+
+    def _one_batch(
+        self,
+        data: Any,
+        measurement: str | None,
+        tag_columns: Sequence[str] | None,
+        field_columns: Sequence[str] | None,
+        time_column: str | None,
+    ) -> Sequence[Any] | None:
+        """``data`` as records if it is the common call that fits in one batch, else None.
+
+        A record, or a list or tuple of at most ``batch_size`` records, needs no chunking.
+        """
+        if measurement is None and tag_columns is None and field_columns is None and time_column is None:
+            kind = type(data)
+            if kind is dict or kind is Point:
+                return (data,)
+            if (kind is list or kind is tuple) and len(data) <= self._chunk_size:
+                return data  # type: ignore[no-any-return]
+        return None
 
     def _write_records(self, records: Sequence[Any], database: str, precision: Precision) -> WriteFuture:
         """Records that fit in one batch: one serialize() and one submit(), no chunking machinery."""
