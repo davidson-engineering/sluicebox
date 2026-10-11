@@ -530,3 +530,22 @@ class TestQueryUsability:
                 self.message = "boom"
 
         assert type(_map_v2_error(ApiError(), "q")).__name__ == kind
+
+    def test_influxdb2_results_may_hold_the_longest_strings(self) -> None:
+        """Flux results are CSV: Python's csv module refuses fields over 128 KiB by default,
+        but InfluxDB stores strings of up to 1 MiB. The (process-wide) limit is only raised."""
+        import csv
+
+        from sluicebox.query import _allow_long_csv_fields
+
+        original = csv.field_size_limit()
+        try:
+            csv.field_size_limit(131_072)
+            _allow_long_csv_fields()
+            value = "x" * (2 * 1024 * 1024)  # 1 MiB of quotes, each doubled by CSV escaping
+            assert next(csv.reader([f'"{value}"'])) == [value]
+            csv.field_size_limit(2**30)
+            _allow_long_csv_fields()
+            assert csv.field_size_limit() == 2**30
+        finally:
+            csv.field_size_limit(original)

@@ -150,6 +150,17 @@ def test_line_protocol_with_multiline_strings_replays(
     ]
 
 
+def test_long_strings_come_back(live_client: InfluxClient, unique: str) -> None:
+    """Strings up to the 1 MiB server limit can be read back, also through sync_schema()
+    (Flux results are CSV, and Python's csv module refuses fields over 128 KiB by default)."""
+    text = "é" * 150_000 + 'with "quotes"'
+    # Before the look-back of other tests' sync_schema(), which older versions would fail.
+    when = int(datetime(2001, 1, 1, tzinfo=UTC).timestamp()) * 10**9
+    live_client.write({"measurement": unique, "fields": {"s": text}, "time": when}).result(timeout=30)
+    assert rows(live_client, unique) == [{"time": when, "s": text}]
+    assert live_client.sync_schema(lookback="10000d")[unique] == {"s": "string"}
+
+
 def test_special_measurement_and_keys(live_client: InfluxClient, unique: str) -> None:
     # "=" in measurement names is rejected for InfluxDB 2 (stored but never queryable there).
     name = f"{unique} m,x=y" if live_client.settings.connection.version == 3 else f"{unique} m,x"
