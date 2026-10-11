@@ -824,10 +824,14 @@ class WriteEngine:
 
         Proxies and load balancers often limit request bodies (nginx defaults to 1 MiB). Without
         this, every oversized batch would be uploaded in full just to be rejected again.
+
+        Only a request built under the current limit teaches something new. Requests already
+        in flight when a lower limit was learned are rejected too; halving the limit again
+        for each of them would shrink it far below the server's.
         """
         limit = max(1024, rejected_bytes // 2)
         with self._lock:
-            if limit >= self._max_batch_bytes:
+            if rejected_bytes > self._max_batch_bytes or limit >= self._max_batch_bytes:
                 return
             self._max_batch_bytes = limit
         self._metrics.batch_limit(limit)

@@ -81,9 +81,12 @@ def test_reverse_proxy_body_limit_is_learned(server_version: int, unique: str, c
     with make_client(server_version, NGINX[server_version], write={"gzip": False}) as client:
         assert client.write(records(unique, n)).result(timeout=120).points == n
         learned = client._engine._max_batch_bytes
-        assert learned <= 256 * 1024  # nginx: client_max_body_size 256k
+        # nginx: client_max_body_size 256k. The limit is half a rejected size (over 256k), and
+        # requests that were in flight under an older limit must not lower it further.
+        assert 128 * 1024 < learned <= 256 * 1024
         assert client.write(records(unique + "_again", n)).result(timeout=120).points == n
-    assert sum("rejected a" in r.getMessage() for r in caplog.records if r.levelname == "WARNING") <= 6
+    # 25,000-line batches (~1.3 MB) need at most three halvings to fit.
+    assert sum("rejected a" in r.getMessage() for r in caplog.records if r.levelname == "WARNING") <= 3
     with server_client(server_version, CollectorRegistry()) as direct:
         assert stored(direct, unique) == n
         assert stored(direct, unique + "_again") == n
