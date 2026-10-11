@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,7 @@ from sluicebox import (
     load_settings,
     measurement,
 )
+from sluicebox._lineprotocol import Dialect
 from sluicebox.client import flux_string
 from sluicebox.types import FieldType
 from tests.servers import V2_BUCKET, V2_ORG, V2_TOKEN, V2_URL, V3_DATABASE, V3_TOKEN, V3_URL
@@ -486,20 +488,38 @@ def test_async_client(server_version: int, unique: str) -> None:
     assert asyncio.run(scenario()) == [{"n": 5003}]
 
 
-def test_server_side_raw_write_then_query(server_version: int, unique: str, make_live_client: Any) -> None:
-    """Data written by another tool is readable, and the server's types can be synced."""
-    line = f"{unique},host=raw v=7i {T0_NS}".encode()
+def _raw_write(server_version: int, body: str) -> int:
+    """POST line protocol without sluicebox (no client-side validation); returns the status."""
     if server_version == 3:
         url = f"{V3_URL}/api/v3/write_lp?db={V3_DATABASE}&precision=nanosecond"
         auth = f"Bearer {V3_TOKEN}"
     else:
         url = f"{V2_URL}/api/v2/write?org={V2_ORG}&bucket={V2_BUCKET}&precision=ns"
         auth = f"Token {V2_TOKEN}"
-    request = urllib.request.Request(url, data=line, method="POST", headers={"Authorization": auth})
-    with urllib.request.urlopen(request, timeout=10) as response:
-        assert response.status == 204
+    request = urllib.request.Request(url, data=body.encode(), method="POST", headers={"Authorization": auth})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.code
+
+
+def test_server_side_raw_write_then_query(server_version: int, unique: str, make_live_client: Any) -> None:
+    """Data written by another tool is readable, and the server's types can be synced."""
+    assert _raw_write(server_version, f"{unique},host=raw v=7i {T0_NS}") == 204
     client = make_live_client()
     assert rows(client, unique) == [{"time": T0_NS, "host": "raw", "v": 7}]
+
+
+def test_client_time_range_is_the_servers(server_version: int, unique: str) -> None:
+    """The client rejects exactly the timestamps the server refuses (on InfluxDB 2, one such
+    line fails its whole request, so a single bad point would take a batch down)."""
+    dialect = Dialect.for_version(server_version)
+    for stamp in (-(2**63), -(2**63) + 1, -(2**63) + 2, 2**63 - 2, 2**63 - 1):
+        storable = dialect.min_time_ns <= stamp <= dialect.max_time_ns
+        status = _raw_write(server_version, f"{unique} v=1 {stamp}")
+        assert (status == 204) == storable, (stamp, status)
 
 
 # ---------------------------------------------------------------------------------------------

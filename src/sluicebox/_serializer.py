@@ -148,6 +148,11 @@ class Serializer:
         self._max_string_chars_fast = self._max_string // 4  # UTF-8 uses at most 4 bytes per char
         self._validate_raw = validation.raw_lines == "validate"
         self._check_overlap = dialect.forbid_tag_field_overlap
+        #: Per precision: (ns divisor, smallest plausible integer stamp, largest storable stamp).
+        self._precisions = {
+            name: (divisor, _PLAUSIBLE_NS // divisor, dialect.time_range(divisor)[1])
+            for name, divisor in PRECISION_DIVISORS.items()
+        }
         self._plans: dict[str, dict[str, _Plan]] = {}
         self._fragments: dict[tuple[str, str], str] = {}
         self._last_datetime: tuple[datetime | None, int] = (None, 0)
@@ -172,10 +177,9 @@ class Serializer:
         ``now_ns`` is the timestamp given to points without one (when ``auto_timestamp``);
         callers pass the same value for every chunk of one ``write()``.
         """
-        divisor = PRECISION_DIVISORS[precision]
-        # Integer timestamps in this range take the fast path; others are checked in _timestamp.
-        stamp_lo = _PLAUSIBLE_NS // divisor
-        stamp_hi = _INT64_MAX // divisor
+        # Integer timestamps from stamp_lo to stamp_hi take the fast path; others are checked in
+        # _timestamp.
+        divisor, stamp_lo, stamp_hi = self._precisions[precision]
         now = None
         if self.auto_timestamp:
             if now_ns is None:
@@ -906,7 +910,7 @@ class Serializer:
                     f"timestamp {value!r} is not finite", code="invalid_time", measurement=measurement
                 )
             nanos = round(value * 1e9)
-            if not _INT64_MIN <= nanos <= _INT64_MAX:
+            if not self.dialect.min_time_ns <= nanos <= self.dialect.max_time_ns:
                 raise ValidationError(
                     f"float timestamp {value!r} is out of range: float timestamps are epoch seconds "
                     "(use an int in the write precision for other units)",
@@ -934,7 +938,11 @@ class Serializer:
                     nanos = None if micros == _NAT else micros * 1000
             except (OverflowError, ValueError):
                 nanos = None
-            if nanos is None or nanos == _NAT or not _INT64_MIN < nanos <= _INT64_MAX:
+            if (
+                nanos is None
+                or nanos == _NAT
+                or not self.dialect.min_time_ns <= nanos <= self.dialect.max_time_ns
+            ):
                 raise ValidationError(
                     f"timestamp {value} is outside the range InfluxDB can store (years 1677 to 2262)",
                     code="invalid_time",
@@ -947,9 +955,8 @@ class Serializer:
             f"unsupported timestamp type {type(value).__name__}", code="invalid_time", measurement=measurement
         )
 
-    @staticmethod
-    def _check_nanos(nanos: int, value: Any, measurement: str) -> None:
-        if not _INT64_MIN <= nanos <= _INT64_MAX:
+    def _check_nanos(self, nanos: int, value: Any, measurement: str) -> None:
+        if not self.dialect.min_time_ns <= nanos <= self.dialect.max_time_ns:
             raise ValidationError(
                 f"timestamp {value} is outside the range InfluxDB can store (years 1677 to 2262)",
                 code="invalid_time",
@@ -959,7 +966,8 @@ class Serializer:
     def _int_timestamp(self, stamp: int, divisor: int, measurement: str) -> int:
         """An integer timestamp outside the fast path's range: reject or warn."""
         unit = _PRECISION_NAMES[divisor]
-        if not _INT64_MIN // divisor <= stamp <= _INT64_MAX // divisor:
+        lowest, highest = self.dialect.time_range(divisor)
+        if not lowest <= stamp <= highest:
             raise ValidationError(
                 f"timestamp {stamp} with precision {unit!r} is outside the range InfluxDB can store; "
                 "is the precision right?",

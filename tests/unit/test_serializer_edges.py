@@ -113,6 +113,42 @@ class TestTimestamps:
         assert error.code == "invalid_time"
         assert "precision 's'" in str(error)
 
+    @pytest.mark.parametrize(
+        ("version", "value", "stored"),
+        [
+            (2, 2**63 - 1, False),  # InfluxDB 2 fails the whole request for it
+            (2, 2**63 - 2, True),
+            (2, -(2**63) + 1, False),
+            (2, -(2**63) + 2, True),
+            (3, 2**63 - 1, True),
+            (3, -(2**63), True),
+        ],
+    )
+    def test_integer_times_at_the_servers_limits(self, version: int, value: int, stored: bool) -> None:
+        record = {"measurement": "m", "fields": {"v": 1.0}, "time": value}
+        if stored:
+            assert serialize(make(version), record) == [f"m v=1.0 {value}"]
+        else:
+            assert rejected(make(version), record).code == "invalid_time"
+
+    @pytest.mark.parametrize("version", [2, 3])
+    def test_extreme_pandas_and_numpy_times_follow_the_server(self, version: int) -> None:
+        import pandas as pd
+
+        for value in (pd.Timestamp.max.tz_localize("UTC"), np.datetime64(2**63 - 1, "ns")):
+            record = {"measurement": "m", "fields": {"v": 1.0}, "time": value}
+            if version == 3:
+                assert serialize(make(version), record) == [f"m v=1.0 {2**63 - 1}"]
+            else:
+                assert rejected(make(version), record).code == "invalid_time"
+
+    def test_coarse_precisions_cannot_overflow_nanoseconds(self) -> None:
+        # -9223372036854776 us is below -2**63 ns: the server could not store it.
+        record = {"measurement": "m", "fields": {"v": 1.0}, "time": -9223372036854776}
+        assert rejected(make(), record, precision="us").code == "invalid_time"
+        record["time"] = -9223372036854775
+        assert serialize(make(), record, precision="us") == ["m v=1.0 -9223372036854775"]
+
     def test_numpy_integers(self) -> None:
         assert serialize(make(), {"measurement": "m", "fields": {"v": 1.0}, "time": np.int64(T0)}) == [
             f"m v=1.0 {T0}"
