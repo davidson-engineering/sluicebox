@@ -17,7 +17,6 @@ from sluicebox import (
     WriteFailure,
 )
 from sluicebox._engine import _ISOLATION_REQUESTS, WriteEngine, _Batch, _Failure, _runs, _unparseable_lines
-from sluicebox._lineprotocol import line_end_problem
 from sluicebox.exceptions import LineError
 from sluicebox.futures import WriteFuture
 
@@ -29,8 +28,6 @@ if TYPE_CHECKING:
 
 T = 1_700_000_000_000_000_000
 BAD = f"m,t=x {T + 99}"  # no field set
-CUT = f'm s="cut short {T + 98}'  # a string value left open
-LEFT_OPEN = line_end_problem(CUT)
 
 
 def good(i: int) -> str:
@@ -72,20 +69,12 @@ class InfluxDB2:
         return Reply()
 
 
-@pytest.fixture
-def unchecked(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Let lines that run on into the next past write(), which rejects them: the engine takes
-    them out of a request whatever reached it."""
-    monkeypatch.setattr("sluicebox._serializer._check_line_ends", lambda *args: None)
-
-
 def v2_client(client_for: Callable[..., InfluxClient], **kwargs: object) -> InfluxClient:
     """A client whose write() calls wait in one open batch until flushed."""
     return client_for(version=2, write={"flush_interval": 60}, **kwargs)
 
 
 class TestIsolation:
-    @pytest.mark.usefixtures("unchecked")
     def test_only_the_unparseable_lines_fail(
         self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
     ) -> None:
@@ -95,7 +84,7 @@ class TestIsolation:
         first = client.write([good(0), good(1)])
         second = client.write([good(2), BAD, good(3)])
         third = client.write([good(4)])
-        fourth = client.write([f"  {BAD}", good(5), CUT])  # leading whitespace is not quoted
+        fourth = client.write([f"  {BAD}", good(5)])  # leading whitespace is not quoted
         client.flush(timeout=5)
         assert first.result(timeout=1).points == 2
         assert third.result(timeout=1).points == 1
@@ -112,67 +101,21 @@ class TestIsolation:
             fourth.result(timeout=1)
         assert [(e.line_number, e.message, e.line) for e in info.value.line_errors] == [
             (1, "invalid field format", f"  {BAD}"),
-            (3, "unbalanced quotes", CUT),
         ]
         assert server.stored == [good(i) for i in range(6)]
-        # The batch, then everything but the three lines the server quoted.
-        assert [len(r.lines) for r in fake.write_requests] == [9, 6]
+        # The batch, then everything but the two lines the server quoted.
+        assert [len(r.lines) for r in fake.write_requests] == [8, 6]
         [failure] = failures
-        assert failure.lines == [BAD, f"  {BAD}", CUT]
+        assert failure.lines == [BAD, f"  {BAD}"]
         assert failure.retryable is False
         assert isinstance(failure.error, PartialWriteError)
         assert [(e.line_number, e.line) for e in failure.error.line_errors] == [
             (1, BAD),
             (2, f"  {BAD}"),
-            (3, CUT),
         ]
         write = client.stats().write
-        assert (write.points_written, write.points_failed) == (6, 3)
+        assert (write.points_written, write.points_failed) == (6, 2)
         assert (write.batches_written, write.batches_failed, write.buffered_bytes) == (0, 1, 0)
-
-    @pytest.mark.usefixtures("unchecked")
-    def test_a_string_left_open_fails_alone(
-        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
-    ) -> None:
-        """InfluxDB 2 reads on into the following lines and quotes them all as one line."""
-        server = InfluxDB2(fake)
-        client = v2_client(client_for)
-        future = client.write([good(0), CUT, good(1), good(2)])
-        with pytest.raises(PartialWriteError) as info:
-            future.result(timeout=5)
-        assert [(e.line_number, e.message) for e in info.value.line_errors] == [(2, LEFT_OPEN)]
-        assert server.stored == [good(0), good(1), good(2)]
-        assert len(fake.write_requests) == 2
-
-    @pytest.mark.usefixtures("unchecked")
-    def test_lines_running_into_the_next_are_never_sent_again(
-        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
-    ) -> None:
-        """A second string left open closes the first: InfluxDB 2 stores the two lines and those
-        between them as one point, without complaint. A trailing backslash escapes the line
-        break (unless the client appends a timestamp to the line). Sent again without the line
-        the server quoted, they would be stored that way."""
-        server = InfluxDB2(fake)
-        first, second = f'm s="one {T + 50}', f'm s="two {T + 51}'
-        escaped = "m,t=a\\"
-        lines = [good(0), first, good(1), good(2), second, good(3), escaped, good(4), BAD, good(5)]
-        client = client_for(version=2, write={"auto_timestamp": False})
-        with pytest.raises(PartialWriteError) as info:
-            client.write(lines).result(timeout=5)
-        assert [(e.line_number, e.line) for e in info.value.line_errors] == [
-            (2, first),
-            (5, second),
-            (7, escaped),
-            (9, BAD),
-        ]
-        assert [e.message for e in info.value.line_errors] == [
-            LEFT_OPEN,
-            LEFT_OPEN,
-            line_end_problem(escaped),
-            "invalid field format",
-        ]
-        assert server.stored == [good(i) for i in range(6)]
-        assert [len(r.lines) for r in fake.write_requests] == [10, 6]
 
     def test_lines_quoted_in_another_form_are_found_by_halving(
         self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
@@ -368,21 +311,6 @@ class TestQuotedLines:
             3: "invalid boolean",
             5: "invalid field format",
         }
-        assert complete
-
-    def test_a_string_left_open_is_its_first_line(self) -> None:
-        lines = ["m v=1 1", 'm s="cut 2', "m v=3 3", "m v=4 4"]
-        found, complete = _unparseable_lines(
-            "unable to parse 'm s=\"cut 2\nm v=3 3\nm v=4 4': unbalanced quotes", lines
-        )
-        assert (found, complete) == ({1: line_end_problem('m s="cut 2')}, True)
-
-    def test_lines_running_into_the_next_are_found_unquoted(self) -> None:
-        """Two strings left open pair up: the server parses them as one line, quoting neither."""
-        lines = ['m s="one 1', "m v=2 2", 'm s="two 3', "m,t=x 4", "m,t=a\\"]
-        found, complete = _unparseable_lines("unable to parse 'm,t=x 4': invalid field format", lines)
-        assert sorted(found) == [0, 2, 3, 4]
-        assert found[3] == "invalid field format"
         assert complete
 
     @pytest.mark.parametrize(

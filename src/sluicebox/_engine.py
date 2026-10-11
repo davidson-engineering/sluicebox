@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 from . import _fork
 from . import futures as _futures
 from ._http import Transport, error_from_response, is_html, unexpected_page_error
-from ._lineprotocol import Dialect, LineSyntaxError, line_end_problem, parse_line
+from ._lineprotocol import Dialect, LineSyntaxError, parse_line
 from ._retry import RetryPolicy
 from .exceptions import (
     BadRequestError,
@@ -245,12 +245,8 @@ def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], 
 
     The message holds ``unable to parse '<line>': <reason>`` for each such line, one after the
     other on new lines, the line without its leading whitespace. A line can contain newlines
-    (in a string field value) and ``': ``, so the reason follows the last ``': ``.
-
-    A line that runs on into the next (:func:`line_end_problem`) is one of them, whatever the
-    error says: the server quotes it together with the lines it runs into (with a reason that
-    is about all of them), or parses them as one line without complaint. Taken out, it cannot
-    join other lines when the rest is sent.
+    (in a string field value) and ``': ``, so the reason follows the last ``': ``. No line runs
+    on into the next (write() rejects those), so each quote is one line of the request.
     """
     quotes: dict[str, str] = {}
     complete = True
@@ -260,8 +256,6 @@ def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], 
             quotes[text] = reason
         else:
             complete = False
-    # A quote of several lines begins with the line that runs on into the others.
-    heads = {text.partition("\n")[0]: text for text in quotes if "\n" in text}
     found: dict[int, str] = {}
     seen: set[str] = set()
     for position, line in enumerate(lines):
@@ -269,13 +263,6 @@ def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], 
         if key in quotes:
             found[position] = quotes[key]
             seen.add(key)
-            continue
-        runs_on = line_end_problem(line)
-        if key in heads:
-            found[position] = runs_on or quotes[heads[key]]
-            seen.add(heads[key])
-        elif runs_on is not None:
-            found[position] = runs_on
     return found, complete and len(seen) == len(quotes)
 
 
@@ -871,8 +858,7 @@ class WriteEngine:
         not one of the lines sent, the lines are halved instead, as for HTTP 413, until the
         halves are written or down to single lines. That costs requests: a batch sends at most
         ``_ISOLATION_REQUESTS`` more, then lines still unwritten fail with the server's error.
-        As the server stored nothing of the request, resending never writes a line twice; as
-        no line that runs on into the next is sent again, the server reads the others as sent.
+        As the server stored nothing of the request, resending never writes a line twice.
         """
         found, complete = _unparseable_lines(error.message, lines)
         if not found and len(lines) == 1:

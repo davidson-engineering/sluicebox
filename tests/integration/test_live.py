@@ -38,7 +38,7 @@ from sluicebox import (
     load_settings,
     measurement,
 )
-from sluicebox._lineprotocol import Dialect, line_end_problem
+from sluicebox._lineprotocol import Dialect
 from sluicebox.client import flux_string
 from sluicebox.types import FieldType
 from tests.servers import V2_BUCKET, V2_ORG, V2_TOKEN, V2_URL, V3_DATABASE, V3_TOKEN, V3_URL
@@ -285,16 +285,12 @@ def test_a_line_the_server_cannot_parse_fails_alone(make_live_client: Any, uniqu
 
 
 def test_influxdb2_lines_it_cannot_parse_fail_alone(
-    server_version: int, make_live_client: Any, unique: str, monkeypatch: pytest.MonkeyPatch
+    server_version: int, make_live_client: Any, unique: str
 ) -> None:
     """InfluxDB 2 refuses a request with lines it cannot parse as a whole and quotes each of them:
-    the client takes them out and sends the rest again. Lines that leave a string open run on
-    into the next: two of them pair up and would be stored as one point, quoted by nobody, and
-    the last hides the line after it from the server until it is gone (three requests here).
-    write() rejects such lines; past that check, the engine still takes them out."""
+    the client takes them out and sends the rest again."""
     if server_version != 2:
         pytest.skip("InfluxDB 2 behaviour")
-    monkeypatch.setattr("sluicebox._serializer._check_line_ends", lambda *args: None)
     failures: list[WriteFailure] = []
     client = make_live_client(write={"flush_interval": 60}, on_error=failures.append)
     lines = [
@@ -302,32 +298,26 @@ def test_influxdb2_lines_it_cannot_parse_fail_alone(
         f"{unique},t=x {ts(2)}",  # no field set
         f'{unique} v=3i,s="two\nlines" {ts(3)}',  # valid: a string may hold a newline
         f"  {unique} v=NaN {ts(4)}",  # quoted without its leading spaces
-        f'{unique} s="open {ts(5)}',  # closed by the quote in line 7: the server parses
-        f"{unique} v=6i {ts(6)}",  # these three lines as one, without complaint
-        f'{unique} s="open {ts(7)}',
-        f"{unique} v=8i {ts(8)}",
-        f'{unique} s="left open {ts(9)}',  # the server reads on to the end of the request
-        f"{unique} v=10i {ts(10)}",
-        f"{unique} v=11i {2**63 - 1}",  # beyond the time range InfluxDB 2 stores
-        f"{unique} v=12i {ts(12)}",
+        f"{unique} v=5i {ts(5)}",
+        f"{unique} v=6i {2**63 - 1}",  # beyond the time range InfluxDB 2 stores
+        f"{unique} v=7i {ts(7)}",
     ]
     future = client.write(lines)
-    other = client.write(f"{unique} v=13i {ts(13)}")
+    other = client.write(f"{unique} v=8i {ts(8)}")
     with pytest.raises(PartialWriteError) as info:
         future.result(timeout=30)
     assert other.result(timeout=30).points == 1
-    rejected = (2, 4, 5, 7, 9, 11)
+    rejected = (2, 4, 6)
     assert [(e.line_number, e.line) for e in info.value.line_errors] == [(n, lines[n - 1]) for n in rejected]
     reasons = [e.message for e in info.value.line_errors]
     assert reasons[:2] == ["invalid field format", "invalid number"]
-    assert reasons[2:5] == [line_end_problem(lines[4])] * 3
-    assert reasons[5].startswith("time outside range")
-    assert [r["v"] for r in rows(client, unique)] == [1, 3, 6, 8, 10, 12, 13]
+    assert reasons[2].startswith("time outside range")
+    assert [r["v"] for r in rows(client, unique)] == [1, 3, 5, 7, 8]
     [failure] = failures
     assert failure.lines == [lines[n - 1] for n in rejected]
     assert failure.retryable is False
     stats = client.stats().write
-    assert (stats.points_written, stats.points_failed) == (7, 6)
+    assert (stats.points_written, stats.points_failed) == (5, 3)
 
 
 def test_client_reads_lines_as_the_server_does(server_version: int, unique: str) -> None:

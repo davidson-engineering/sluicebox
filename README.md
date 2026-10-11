@@ -585,12 +585,9 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
   line protocol is sent unvalidated by default) fails the whole batch, other `write()` calls'
   points included, and a replay of the dead-lettered batch fails again. Its HTTP 400 quotes each
   such line: sluicebox takes those out and sends the rest again, so every valid line is written
-  and only the bad ones fail, each for its own `write()` call. Lines the server would read
-  together with the next line (see below) are rejected by `write()`; should one be in a
-  request anyway, it is taken out too, whether the server complains about it or not. When the
-  quotes do not match the lines sent, the request is halved instead, as for HTTP 413. This
-  costs at most 64 extra requests per batch, and a request the server may have partly stored
-  is never resent.
+  and only the bad ones fail, each for its own `write()` call. When the quotes do not match
+  the lines sent, the request is halved instead, as for HTTP 413. This costs at most 64 extra
+  requests per batch, and a request the server may have partly stored is never resent.
 - Both servers end a line at a newline only outside string values, and take a backslash to
   escape any character, the newline too. A line leaving a string value open, or ending in a
   backslash, therefore runs on into the next line of the request: InfluxDB 3 neither stores
