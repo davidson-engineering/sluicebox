@@ -200,7 +200,8 @@ A batch that still fails after retries (or that the server rejects) is reported:
 
 - to the futures of the `write()` calls whose points it carried: `result()` / `await` raise
   one error for the call, and `future.errors` lists every batch's error. When the server
-  rejects single lines (InfluxDB 3 partial writes, and lines InfluxDB 2 cannot parse, see
+  rejects single lines (InfluxDB 3 partial writes, and the lines InfluxDB 2, or InfluxDB 3 on
+  `/api/v2/write`, refuses a whole request for, see
   [Server behaviour handled for you](#server-behaviour-handled-for-you)), the rest of the batch
   is written and only the calls that contained a rejected line fail, with a `PartialWriteError`
   whose `line_errors` give each rejected line (as sent) and its number within that call;
@@ -583,7 +584,22 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
   for HTTP 413. This costs at most 64 extra requests per batch, and a request the server may
   have partly stored is never resent.
 - On InfluxDB 3, `/api/v3/write_lp` (the default for version 3) keeps the valid lines of a batch
-  and names the rejected ones; `/api/v2/write` rejects the whole batch.
+  and names the rejected ones. `/api/v2/write` (`write.api = "v2"`) stores nothing of a request
+  with one line it cannot parse, or that gives a column another type than its table has, and
+  names the reason but not the line. sluicebox sends the lines that reason can be about (lines
+  it cannot parse either, or that give the column the refused type, a request per table)
+  apart from the others, which go in one request. Lines of one table that all give a field the
+  refused type fail together, and their type conflict teaches the client the server's type.
+  Lines that may run on into the next go alone (two of them can be stored as one point,
+  swallowing the lines between). Otherwise the request is halved, which costs about
+  2 x log2(lines) requests per refused line: about 30 in a 25,000-line batch. This matters
+  because a request the server stores takes up to a second (it acknowledges on its WAL flush),
+  while one it refuses takes milliseconds. The same limit of 64 extra requests per batch
+  applies.
+- InfluxDB 3 Cloud Serverless, Dedicated and Clustered keep the valid lines of a request by
+  default (Serverless always), so after their HTTP 400 for some lines nothing is resent: the
+  whole request is reported as failed (replaying it is harmless, as every point carries its
+  timestamp).
 - Flux parameters (`params.x`) are a Cloud-only feature; sluicebox binds them so they work on OSS.
 
 ## Development

@@ -328,6 +328,126 @@ def test_influxdb2_lines_it_cannot_parse_fail_alone(
     assert (stats.points_written, stats.points_failed) == (7, 6)
 
 
+def _raw_v2_write_to_v3(body: str) -> tuple[int, str]:
+    """POST line protocol to InfluxDB 3's /api/v2/write without sluicebox: the status and answer."""
+    url = f"{V3_URL}/api/v2/write?bucket={V3_DATABASE}&precision=ns"
+    request = urllib.request.Request(
+        url, data=body.encode(), method="POST", headers={"Authorization": f"Bearer {V3_TOKEN}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return int(response.status), response.read().decode()
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.code, error.read().decode()
+
+
+def test_influxdb3_v2_api_stores_nothing_of_a_refused_request(server_version: int, unique: str) -> None:
+    """What isolating lines on InfluxDB 3's /api/v2/write relies on: one line it cannot parse, or
+    that gives a column another type than its table has (stored or from an earlier line), and it
+    stores none of the request, however large, naming the reason but not the line."""
+    if server_version != 3:
+        pytest.skip("InfluxDB 3 behaviour")
+    assert _raw_v2_write_to_v3(f"{unique}_stored v=0i {ts(0)}")[0] == 204
+    many = [f"{{m}} v={i}i {ts(i)}" for i in range(1, 20_001)]
+    cases = {
+        "no_fields": ([f"{{m}} v=1i {ts(1)}", f"{{m}},t=x {ts(2)}", f"{{m}} v=3i {ts(3)}"], "No fields"),
+        "stored_type": ([f"{{m}} v=1i {ts(1)}", f"{{m}} v=2.5 {ts(2)}"], "field::integer, got"),
+        "request_type": ([f"{{m}} v=1i {ts(1)}", f"{{m}} v=2.5 {ts(2)}"], "field::integer, got"),
+        "tag_and_field": ([f"{{m}} v=1i {ts(1)}", f"{{m}},v=a x=1i {ts(2)}"], "got iox::column_type::tag"),
+        "large": ([*many[:10_000], f"{{m}} v=1.5 {ts(0)}", *many[10_000:]], "field::integer, got"),
+    }
+    for name, (lines, reason) in cases.items():
+        table = f"{unique}_stored" if name == "stored_type" else f"{unique}_{name}"
+        status, answer = _raw_v2_write_to_v3("\n".join(line.format(m=table) for line in lines))
+        assert status == 400, (name, answer)
+        message = json.loads(answer)["message"]
+        assert message.startswith("write buffer error: line protocol parse failed: "), (name, message)
+        assert reason in message, (name, message)
+    with InfluxClient(
+        load_settings(
+            None,
+            env_file=None,
+            token=V3_TOKEN,
+            connection={"url": V3_URL, "version": 3, "database": V3_DATABASE},
+        ),
+        registry=CollectorRegistry(),
+    ) as client:
+        assert [r["v"] for r in rows(client, f"{unique}_stored")] == [0]
+        tables = client.query("SHOW TABLES").to_dicts()
+    assert not [
+        t
+        for t in tables
+        if t["table_name"].startswith(f"{unique}_") and not t["table_name"].endswith("_stored")
+    ]
+
+
+def test_influxdb3_v2_api_refused_lines_fail_alone(
+    make_live_client: Any, unique: str, server_version: int
+) -> None:
+    """InfluxDB 3 refuses a whole /api/v2/write request for one line, naming no line: the client
+    sends the lines the reason can be about apart from the others, so only they fail. Lines of
+    the type the server refused teach the client its type."""
+    if server_version != 3:
+        pytest.skip("InfluxDB 3 behaviour")
+    failures: list[WriteFailure] = []
+    client = make_live_client(write={"api": "v2", "flush_interval": 60}, on_error=failures.append)
+    client.write(f"{unique} v=0i {ts(0)}").result(timeout=30)
+    joined = f"{unique}_joined"
+    first, second = f'{joined} s="a {ts(1)}', f'{joined} s=",n=1i {ts(3)}'  # one valid line together
+    lines = [
+        f"{unique} v=1i {ts(1)}",
+        f"{unique},t=x {ts(2)}",  # no field set
+        f"{unique} v=3.5 {ts(3)}",  # the server stores integers
+        f"{unique} v=4i {ts(4)}",
+        first,
+        f"{joined} v=5i {ts(5)}",
+        second,
+        f"{unique},v=a x=6i {ts(6)}",  # a tag named like the field
+        f"{unique} v=7.5 {ts(7)}",
+        f"{unique} v=8i {ts(8)}",
+    ]
+    future = client.write(lines)
+    other = client.write(f"{unique} v=9i {ts(9)}")
+    client.flush(timeout=60)
+    assert other.result(timeout=1).points == 1
+    with pytest.raises(PartialWriteError) as info:
+        future.result(timeout=1)
+    rejected = (2, 3, 5, 7, 8, 9)
+    assert [(e.line_number, e.line) for e in info.value.line_errors] == [(n, lines[n - 1]) for n in rejected]
+    reasons = [e.message for e in info.value.line_errors]
+    assert reasons[0] == "No fields were provided"
+    assert "expected iox::column_type::field::integer, got iox::column_type::field::float" in reasons[1]
+    assert "got iox::column_type::tag" in reasons[4]
+    assert [r["v"] for r in rows(client, unique)] == [0, 1, 4, 8, 9]
+    assert rows(client, joined) == [{"time": ts(5), "v": 5}]
+    [failure] = failures
+    assert failure.lines == [lines[n - 1] for n in rejected]
+    assert client.stats().write.points_failed == 6
+    assert client.locked_types(unique) == {"v": FieldType.INTEGER}
+
+
+def test_influxdb3_v2_api_isolates_in_a_large_batch(
+    make_live_client: Any, unique: str, server_version: int
+) -> None:
+    """A fresh process writing floats to an integer field: 5,000 such lines among 25,000 cost two
+    more requests, not a request per line or halving 25,000 lines for each."""
+    if server_version != 3:
+        pytest.skip("InfluxDB 3 behaviour")
+    make_live_client().write({"measurement": unique, "fields": {"v": 0}, "time": ts(0)}).result(timeout=30)
+    client = make_live_client(write={"api": "v2", "flush_interval": 60})
+    lines = [f"{unique} v={i}i {ts(i)}" if i % 5 else f"{unique} v={i}.5 {ts(i)}" for i in range(1, 25_001)]
+    started = time.monotonic()
+    with pytest.raises(PartialWriteError) as info:
+        client.write(lines).result(timeout=60)
+    elapsed = time.monotonic() - started
+    assert len(info.value.line_errors) == 5_000
+    count = client.query(f'SELECT count(*) AS n FROM "{unique}"').to_dicts()
+    assert count == [{"n": 20_001}]
+    assert client.stats().write.points_written == 20_000
+    assert elapsed < 10, elapsed  # three requests; one the server stores takes it up to a second
+
+
 def test_client_reads_lines_as_influxdb2_does(server_version: int, unique: str) -> None:
     """influxdb2_runs_on() knows which lines InfluxDB 2 reads the next line into: each is written
     before a line without fields, which the server quotes on its own unless joined to it."""
