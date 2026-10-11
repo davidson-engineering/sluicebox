@@ -8,8 +8,9 @@
 * lets ``concurrency`` sender threads gzip and POST sealed batches over a keep-alive
   connection pool, retrying transient failures with backoff, splitting batches the
   server rejects as too large (HTTP 413) and resending the rest of a batch without the
-  lines InfluxDB 2 cannot parse; a sender takes queued batches of the same database and
-  precision along in one request while the size limits allow;
+  lines the server refused it for (InfluxDB 2, and InfluxDB 3 on /api/v2/write); a sender
+  takes queued batches of the same database and precision along in one request while the
+  size limits allow;
 * bounds memory with ``max_pending_bytes`` (block / drop / raise when full);
 * resolves each ``write()`` call's :class:`~sluicebox.futures.WriteFuture`, attributing
   per-line partial-write errors to the exact call (and line) that produced them.
@@ -41,7 +42,7 @@ from typing import TYPE_CHECKING, Any
 from . import _fork
 from . import futures as _futures
 from ._http import Transport, error_from_response, is_html, unexpected_page_error
-from ._lineprotocol import Dialect, LineSyntaxError, parse_line
+from ._lineprotocol import Dialect, LineSyntaxError, ParsedLine, UInt, parse_line
 from ._retry import RetryPolicy
 from .exceptions import (
     BadRequestError,
@@ -76,10 +77,18 @@ _V3_PRECISION = {"ns": "nanosecond", "us": "microsecond", "ms": "millisecond", "
 _MAX_RECORDED_FAILURES = 100
 #: A 413 for a request this small is not about its size (e.g. a proxy refusing all bodies).
 _MIN_SPLIT_BYTES = 1024
-#: Extra requests a batch may send to single out the lines InfluxDB 2 cannot parse (_isolate).
+#: Extra requests a batch may send to single out the lines a server refuses it for (_isolate).
 _ISOLATION_REQUESTS = 64
 #: How InfluxDB 2 quotes each line it cannot parse in its HTTP 400 answer.
 _UNPARSEABLE = "unable to parse '"
+#: How InfluxDB 3's /api/v2/write refuses a request for a line it cannot parse or store (it
+#: names the reason, but not the line).
+_V3_REFUSED = "write buffer error: line protocol parse failed: "
+#: A column given another type than InfluxDB 3 has for it (stored, or from an earlier line).
+_V3_COLUMN_CONFLICT = re.compile(
+    r"invalid column type for column '(?P<column>[^']+)', "
+    r"expected iox::column_type::(?P<expected>[\w:]+), got iox::column_type::(?P<got>[\w:]+)"
+)
 # Field type conflicts reported by the servers: (field, the type the server stores).
 _V3_TYPE_CONFLICT = re.compile(
     r"invalid column type for column '(?P<field>[^']+)', expected iox::column_type::field::(?P<type>\w+)"
@@ -239,7 +248,37 @@ def _runs(indices: Sequence[int]) -> list[tuple[int, int]]:
     return runs
 
 
-def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], bool]:
+def _part(items: Sequence[Any], positions: Sequence[int]) -> Sequence[Any]:
+    """The items at ``positions`` (a range of them is sliced)."""
+    if isinstance(positions, range):
+        return items[positions.start : positions.stop]
+    return [items[position] for position in positions]
+
+
+def _halves(count: int) -> list[Sequence[int]]:
+    return [range(count // 2), range(count // 2, count)]
+
+
+def _iox_type(line: ParsedLine, column: str) -> str | None:
+    """The type ``line`` gives ``column`` as InfluxDB 3 names it in errors (``tag``,
+    ``field::integer``, ...), or None. A tag and a field of the same name read as the tag."""
+    if column in line.tags:
+        return "tag"
+    if column not in line.fields:
+        return None
+    value = line.fields[column]
+    if isinstance(value, bool):
+        return "field::boolean"
+    if isinstance(value, UInt):
+        return "field::uinteger"
+    if isinstance(value, int):
+        return "field::integer"
+    if isinstance(value, float):
+        return "field::float"
+    return "field::string"
+
+
+def _unparseable_lines(message: str, lines: Sequence[str]) -> tuple[dict[int, str], bool]:
     """The lines of a request InfluxDB 2 cannot parse, ``{position in lines: reason}``, and
     whether they account for every line its error quotes.
 
@@ -266,19 +305,25 @@ def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], 
     return found, complete and len(seen) == len(quotes)
 
 
-def _unparseable_error(source: BadRequestError, line_errors: tuple[LineError, ...]) -> PartialWriteError:
-    """The lines of a request the server could not parse, which fail alone: a partial write."""
+def _unparseable_error(
+    source: BadRequestError, line_errors: tuple[LineError, ...], verb: str = "unable to parse"
+) -> PartialWriteError:
+    """The lines of a request the server refused it for, which fail alone: a partial write."""
     details = "; ".join(f"line {e.line_number}: {e.message}" for e in line_errors[:3])
     if len(line_errors) > 3:
         details += f"; ... {len(line_errors) - 3} more"
     return PartialWriteError(
-        f"unable to parse {len(line_errors)} line{'s' if len(line_errors) > 1 else ''}: {details}",
+        f"{verb} {len(line_errors)} line{'s' if len(line_errors) > 1 else ''}: {details}",
         status=source.status,
         code=source.code,
         body=source.body,
         request_id=source.request_id,
         line_errors=line_errors,
     )
+
+
+def _refused_error(source: BadRequestError, line_errors: tuple[LineError, ...]) -> PartialWriteError:
+    return _unparseable_error(source, line_errors, "the server refused")
 
 
 def _partial_error(
@@ -796,10 +841,10 @@ class WriteEngine:
         self._send(batch, batch.lines, range(len(batch.lines)), outcome)
         return outcome
 
-    def _send(self, batch: _Batch, lines: list[str], indices: Sequence[int], outcome: _Outcome) -> None:
+    def _send(self, batch: _Batch, lines: Sequence[str], indices: Sequence[int], outcome: _Outcome) -> None:
         """Send ``lines`` (batch lines ``indices``), recording failures in ``outcome``.
 
-        ``indices`` is a range, unless lines the server could not parse were taken out.
+        ``indices`` is a range, unless the lines are part of a request the server refused.
         """
         payload = "\n".join(lines).encode("utf-8")
         try:
@@ -836,6 +881,8 @@ class WriteEngine:
         except BadRequestError as exc:
             if self._api == "v2" and exc.message.startswith(_UNPARSEABLE):
                 self._isolate(batch, lines, indices, exc, outcome)
+            elif self._api == "v2" and exc.message.startswith(_V3_REFUSED):
+                self._isolate_unnamed(batch, lines, indices, exc, outcome)
             else:
                 _fail(outcome, indices, exc)
         except SluiceboxError as exc:
@@ -844,7 +891,7 @@ class WriteEngine:
     def _isolate(
         self,
         batch: _Batch,
-        lines: list[str],
+        lines: Sequence[str],
         indices: Sequence[int],
         error: BadRequestError,
         outcome: _Outcome,
@@ -856,8 +903,7 @@ class WriteEngine:
         WriteFailure fails the same way. Its error quotes each such line, so those fail alone
         (as in a partial write) and the others are sent again. If it quotes something that is
         not one of the lines sent, the lines are halved instead, as for HTTP 413, until the
-        halves are written or down to single lines. That costs requests: a batch sends at most
-        ``_ISOLATION_REQUESTS`` more, then lines still unwritten fail with the server's error.
+        halves are written or down to single lines (see _resend for what that may cost).
         As the server stored nothing of the request, resending never writes a line twice.
         """
         found, complete = _unparseable_lines(error.message, lines)
@@ -866,12 +912,7 @@ class WriteEngine:
             _, separator, reason = error.message.rpartition("': ")
             found = {0: reason if separator else error.message}
         if found:
-            positions = sorted(found)
-            line_errors = tuple(LineError(p + 1, found[p], lines[p]) for p in positions)
-            rejected = _unparseable_error(error, line_errors)
-            for position, line_error in zip(positions, line_errors, strict=True):
-                index = indices[position]
-                outcome.failures.append(_Failure(index, index + 1, rejected, line_error))
+            self._reject(lines, indices, found, _unparseable_error, error, outcome)
             keep = [p for p in range(len(lines)) if p not in found]
             if not keep:
                 return
@@ -879,26 +920,123 @@ class WriteEngine:
             indices = [indices[p] for p in keep]
         # The rest goes in one request when the server named every line it cannot parse (or
         # only one is left), else in halves. A sub-request's error names its own bad lines.
-        whole = len(lines) == 1 or (bool(found) and complete)
-        cost = 1 if whole else 2
-        if cost <= outcome.isolation_budget:
-            outcome.isolation_budget -= cost
-            if whole:
-                log.debug(
-                    "the server cannot parse %d lines; sending the other %d again", len(found), len(lines)
-                )
-                self._send(batch, lines, indices, outcome)
-            else:
-                middle = len(lines) // 2
-                log.debug("the server cannot parse some of %d lines; sending them in two halves", len(lines))
-                self._send(batch, lines[:middle], indices[:middle], outcome)
-                self._send(batch, lines[middle:], indices[middle:], outcome)
+        parts: list[Sequence[int]]
+        if len(lines) == 1 or (found and complete):
+            log.debug("the server cannot parse %d lines; sending the other %d again", len(found), len(lines))
+            parts = [range(len(lines))]
+        else:
+            log.debug("the server cannot parse some of %d lines; sending them in two halves", len(lines))
+            parts = _halves(len(lines))
+        self._resend(batch, lines, indices, parts, error, outcome)
+
+    def _isolate_unnamed(
+        self,
+        batch: _Batch,
+        lines: Sequence[str],
+        indices: Sequence[int],
+        error: BadRequestError,
+        outcome: _Outcome,
+    ) -> None:
+        """Write the lines of a request InfluxDB 3 refused on /api/v2/write for one line.
+
+        It stores nothing of a request with a line it cannot parse, or that gives a column
+        another type than the table has (stored, or from an earlier line of the request), and
+        names the reason but not the line. Halving would find each such line in about
+        2 * log2(lines) requests, and every request the server stores takes it up to a second
+        (it acknowledges on its WAL flush), refused ones milliseconds. So the lines the reason
+        can be about are sent apart from the others, which go in one request: the lines the
+        client cannot parse either, or those giving the column the type the server refused,
+        a request per table. All lines of a request giving one table's field the refused type
+        of another field type fail together: the server's type came from none of them. Only
+        when the client cannot tell which lines the reason is about are the lines halved. Each
+        request's error is handled the same way.
+        """
+        reason = error.message[len(_V3_REFUSED) :]
+        if len(lines) == 1:
+            self._reject(lines, indices, {0: reason}, _refused_error, error, outcome)
             return
-        error.add_note(
-            f"{len(lines)} line(s) that may be valid were not written: lines the server cannot parse "
-            f"are singled out with at most {_ISOLATION_REQUESTS} extra requests per batch"
-        )
-        _fail(outcome, indices, error)
+        conflict = _V3_COLUMN_CONFLICT.search(reason)
+        others: list[int] = []
+        suspects: dict[str, list[int]] = {}  # by table ("" for lines the client cannot parse)
+        for position, line in enumerate(lines):
+            try:
+                parsed = parse_line(self._dialect, line.lstrip(" \t"))
+            except LineSyntaxError:
+                if conflict is None:
+                    suspects.setdefault("", []).append(position)
+                else:
+                    others.append(position)
+                continue
+            if conflict is not None and _iox_type(parsed, conflict["column"]) == conflict["got"]:
+                suspects.setdefault(parsed.measurement, []).append(position)
+            else:
+                others.append(position)
+        if (
+            conflict is not None
+            and not others
+            and len(suspects) == 1
+            and conflict["expected"].startswith("field::")
+            and conflict["got"].startswith("field::")
+        ):
+            self._reject(
+                lines, indices, dict.fromkeys(range(len(lines)), reason), _refused_error, error, outcome
+            )
+            return
+        parts: list[Sequence[int]] = [part for part in (others, *suspects.values()) if part]
+        if len(parts) > 1:
+            log.debug(
+                "the server refused %d lines (%s); sending them in %d parts", len(lines), reason, len(parts)
+            )
+        else:
+            log.debug("the server refused %d lines (%s); sending them in two halves", len(lines), reason)
+            parts = _halves(len(lines))
+        self._resend(batch, lines, indices, parts, error, outcome)
+
+    @staticmethod
+    def _reject(
+        lines: Sequence[str],
+        indices: Sequence[int],
+        found: dict[int, str],
+        make_error: Callable[[BadRequestError, tuple[LineError, ...]], PartialWriteError],
+        error: BadRequestError,
+        outcome: _Outcome,
+    ) -> None:
+        """Record that the server refused ``lines`` at the positions of ``found`` (with its reasons)."""
+        positions = sorted(found)
+        line_errors = tuple(LineError(p + 1, found[p], lines[p]) for p in positions)
+        rejected = make_error(error, line_errors)
+        for position, line_error in zip(positions, line_errors, strict=True):
+            index = indices[position]
+            outcome.failures.append(_Failure(index, index + 1, rejected, line_error))
+
+    def _resend(
+        self,
+        batch: _Batch,
+        lines: Sequence[str],
+        indices: Sequence[int],
+        parts: list[Sequence[int]],
+        error: BadRequestError,
+        outcome: _Outcome,
+    ) -> None:
+        """Send ``parts`` (positions in ``lines``) of a request the server stored nothing of, each
+        in a request of its own, as far as the batch's budget for that allows.
+
+        A batch sends at most ``_ISOLATION_REQUESTS`` such requests; the parts left over (the
+        last ones: put the most promising first) fail with the server's error. Halving costs
+        about 2 * log2(lines) requests per line the server refuses, so the budget finds two in
+        25,000 lines that way, and many more where the server or the client can tell them.
+        """
+        affordable = parts[: outcome.isolation_budget]
+        outcome.isolation_budget -= len(affordable)
+        for part in affordable:
+            self._send(batch, _part(lines, part), _part(indices, part), outcome)
+        unsent = sorted(position for part in parts[len(affordable) :] for position in part)
+        if unsent:
+            error.add_note(
+                f"{len(unsent)} line(s) that may be valid were not written: the lines a server refuses "
+                f"a request for are singled out with at most {_ISOLATION_REQUESTS} extra requests per batch"
+            )
+            _fail(outcome, _part(indices, unsent), error)
 
     def _post(self, batch: _Batch, payload: bytes, outcome: _Outcome) -> None:
         """POST one payload, retrying transient failures. Raises the final error."""
