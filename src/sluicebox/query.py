@@ -300,6 +300,20 @@ def _flight_message(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------------------------
 
 
+#: InfluxDB stores string fields of up to 1 MiB, but the official client parses Flux results
+#: with the csv module, which refuses fields over 128 KiB by default: a query returning one
+#: longer value failed (as did sync_schema() over a time range holding one). The limit is
+#: process-wide, so it is only ever raised; this leaves room for doubled quotes too.
+_CSV_FIELD_LIMIT = 64 * 1024 * 1024
+
+
+def _allow_long_csv_fields() -> None:
+    import csv
+
+    if csv.field_size_limit() < _CSV_FIELD_LIMIT:
+        csv.field_size_limit(_CSV_FIELD_LIMIT)
+
+
 class V2QueryBackend:
     def __init__(self, settings: InfluxSettings) -> None:
         try:
@@ -308,6 +322,7 @@ class V2QueryBackend:
             raise ConfigurationError(
                 f"querying InfluxDB 2 needs the official client: {_install_hint('v2')}"
             ) from None
+        _allow_long_csv_fields()
         self.pid = os.getpid()
         conn = settings.connection
         assert settings.token is not None

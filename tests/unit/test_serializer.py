@@ -236,6 +236,24 @@ class TestByteCounts:
         assert chunk.nbytes > sum(len(line) + 1 for line in chunk.lines)
 
 
+class TestTagSetCache:
+    @pytest.mark.parametrize("static", [{}, {"env": "prod"}], ids=["plain", "static-tags"])
+    def test_a_cached_tag_set_is_only_reused_for_the_same_tags(self, static: dict[str, str]) -> None:
+        """Property: with keys and values drawn from one alphabet (so that {"a": "b", "c": "d"}
+        and {"a": "c", "b": "d"} both occur), a serializer that has cached every tag set it saw
+        writes exactly what a fresh one writes for each record."""
+        import random
+
+        rng = random.Random(11)
+        alphabet = ["a", "b", "c", "d", "", None, 1, 1.0, True]
+        cached = make(tags=TagsConfig(static=static))
+        for i in range(3000):
+            keys = rng.sample(["a", "b", "c", "d", "env"], rng.randint(0, 4))
+            tags = {key: rng.choice(alphabet) for key in keys}
+            record = {"measurement": "m", "tags": tags, "fields": {"v": 1.0}, "time": T0 + i}
+            assert lines(cached, record) == lines(make(tags=TagsConfig(static=static)), record), tags
+
+
 class TestTypeLocking:
     def test_int_then_float_conflicts_with_hint(self) -> None:
         s = make()

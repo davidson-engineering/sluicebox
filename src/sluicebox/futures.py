@@ -15,6 +15,7 @@ import asyncio
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -22,7 +23,8 @@ from .exceptions import InfluxTimeoutError, PartialWriteError, ValidationError
 from .log import RateLimitedLog
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Sequence
+    from contextlib import AbstractContextManager
 
     from ._engine import WriteEngine
 
@@ -33,9 +35,8 @@ MAX_REJECTED = 1000
 
 log = logging.getLogger("sluicebox.write")
 
-# One lock for all futures: state transitions are tiny and rare relative to serialization.
-# The write engine holds it across fork() (see ``_engine``), so the child inherits it unlocked.
-_LOCK = threading.Lock()
+#: A future without an engine is complete from the start: nothing else can change it.
+_UNSHARED = nullcontext()
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,39 +82,58 @@ class WriteFuture:
         #: Records dropped before sending.
         self.dropped = 0
         #: Validation errors of the dropped records (capped at ``MAX_REJECTED``).
-        self.rejected: list[ValidationError] = []
+        self.rejected: Sequence[ValidationError] = ()
         self._pending = 0  # batches carrying our lines that have not completed
         self._sealed = False  # all of our lines have been handed over
         self._done = False
         self._observed = False  # the outcome was retrieved (flush/close then skip its failures)
-        self._errors: list[BaseException] = []
+        # A list only once there is an error: buffered writes keep their futures alive, and
+        # every object they hold is more work for the cyclic garbage collector.
+        self._errors: Sequence[BaseException] = ()
         self._event: threading.Event | None = None
         self._callbacks: list[Callable[[WriteFuture], Any]] | None = None
         self._started_at = time.monotonic()
         self._finished_at = 0.0
 
     # -- engine side ------------------------------------------------------------------------
+    #
+    # The state below (_pending, _sealed, _done, _errors, _event, _callbacks) is guarded by
+    # the engine's lock, which the engine already holds when it attaches or releases a
+    # future. Events are set and callbacks run outside of it (_complete).
 
-    def _attach(self) -> None:
-        """A batch now carries some of our lines (called with the engine lock held)."""
-        with _LOCK:
-            self._pending += 1
+    def _lock(self) -> AbstractContextManager[Any]:
+        engine = self._engine
+        return engine._lock if engine is not None else _UNSHARED
 
-    def _batch_done(self, error: BaseException | None) -> None:
-        with _LOCK:
-            if error is not None:
-                self._errors.append(error)
-            self._pending -= 1
-            finished = self._sealed and self._pending == 0 and not self._done
-            if finished:
-                self._done = True
-                self._finished_at = time.monotonic()
-        if finished:
-            self._complete()
+    def _attach(self, seal: bool = False) -> None:
+        """A batch now carries some of our lines (engine lock held).
+
+        ``seal``: they are the last lines of this call. Unlike :meth:`_seal`, this cannot
+        complete the future: the batch that carries them has not been sent yet.
+        """
+        self._pending += 1
+        if seal:
+            self._sealed = True
+
+    def _release(self, error: BaseException | None, now: float) -> bool:
+        """A batch carrying our lines completed at ``now`` (engine lock held).
+
+        Returns True if that completed the future and there are waiters or callbacks: the
+        caller then calls :meth:`_complete` once it has released the lock. (Registering one
+        later sees the future done and handles it itself.)
+        """
+        if error is not None:
+            self._errors = [*self._errors, error]
+        self._pending -= 1
+        if self._sealed and self._pending == 0 and not self._done:
+            self._done = True
+            self._finished_at = now
+            return self._event is not None or self._callbacks is not None
+        return False
 
     def _seal(self) -> None:
         """No more lines will be added for this call."""
-        with _LOCK:
+        with self._lock():
             self._sealed = True
             finished = self._pending == 0 and not self._done
             if finished:
@@ -123,6 +143,7 @@ class WriteFuture:
             self._complete()
 
     def _complete(self) -> None:
+        """Wake waiters and run callbacks (without the lock, once the future is done)."""
         event = self._event
         if event is not None:
             event.set()
@@ -174,7 +195,7 @@ class WriteFuture:
 
     def add_done_callback(self, callback: Callable[[WriteFuture], Any]) -> None:
         """Call ``callback(self)`` once complete (immediately if already complete)."""
-        with _LOCK:
+        with self._lock():
             if not self._done:
                 if self._callbacks is None:
                     self._callbacks = []
@@ -249,7 +270,7 @@ class WriteFuture:
         return error
 
     def _ensure_event(self) -> threading.Event:
-        with _LOCK:
+        with self._lock():
             if self._event is None:
                 self._event = threading.Event()
                 if self._done:
@@ -315,6 +336,6 @@ def completed_future(points: int = 0, dropped: int = 0, error: BaseException | N
     future.points = points
     future.dropped = dropped
     if error is not None:
-        future._errors.append(error)
+        future._errors = [error]
     future._seal()
     return future

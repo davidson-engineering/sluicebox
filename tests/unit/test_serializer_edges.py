@@ -113,6 +113,42 @@ class TestTimestamps:
         assert error.code == "invalid_time"
         assert "precision 's'" in str(error)
 
+    @pytest.mark.parametrize(
+        ("version", "value", "stored"),
+        [
+            (2, 2**63 - 1, False),  # InfluxDB 2 fails the whole request for it
+            (2, 2**63 - 2, True),
+            (2, -(2**63) + 1, False),
+            (2, -(2**63) + 2, True),
+            (3, 2**63 - 1, True),
+            (3, -(2**63), True),
+        ],
+    )
+    def test_integer_times_at_the_servers_limits(self, version: int, value: int, stored: bool) -> None:
+        record = {"measurement": "m", "fields": {"v": 1.0}, "time": value}
+        if stored:
+            assert serialize(make(version), record) == [f"m v=1.0 {value}"]
+        else:
+            assert rejected(make(version), record).code == "invalid_time"
+
+    @pytest.mark.parametrize("version", [2, 3])
+    def test_extreme_pandas_and_numpy_times_follow_the_server(self, version: int) -> None:
+        import pandas as pd
+
+        for value in (pd.Timestamp.max.tz_localize("UTC"), np.datetime64(2**63 - 1, "ns")):
+            record = {"measurement": "m", "fields": {"v": 1.0}, "time": value}
+            if version == 3:
+                assert serialize(make(version), record) == [f"m v=1.0 {2**63 - 1}"]
+            else:
+                assert rejected(make(version), record).code == "invalid_time"
+
+    def test_coarse_precisions_cannot_overflow_nanoseconds(self) -> None:
+        # -9223372036854776 us is below -2**63 ns: the server could not store it.
+        record = {"measurement": "m", "fields": {"v": 1.0}, "time": -9223372036854776}
+        assert rejected(make(), record, precision="us").code == "invalid_time"
+        record["time"] = -9223372036854775
+        assert serialize(make(), record, precision="us") == ["m v=1.0 -9223372036854775"]
+
     def test_numpy_integers(self) -> None:
         assert serialize(make(), {"measurement": "m", "fields": {"v": 1.0}, "time": np.int64(T0)}) == [
             f"m v=1.0 {T0}"
@@ -134,6 +170,60 @@ class TestFloats:
         assert serialize(serializer, {"measurement": "m", "fields": {"v": 2**53}}) == [
             "m v=9007199254740992.0"
         ]
+
+
+UNPAIRED = "x\ud800y"
+UNENCODABLE = [
+    ({"measurement": UNPAIRED, "fields": {"v": 1.0}}, "invalid_name"),
+    ({"measurement": "m", "tags": {UNPAIRED: "a"}, "fields": {"v": 1.0}}, "invalid_name"),
+    ({"measurement": "m", "tags": {"t": UNPAIRED}, "fields": {"v": 1.0}}, "invalid_tag_value"),
+    ({"measurement": "m", "fields": {UNPAIRED: 1.0}}, "invalid_name"),
+    ({"measurement": "m", "fields": {"v": 1.0, "s": UNPAIRED}}, "invalid_encoding"),
+    (f'm s="{UNPAIRED}"', "invalid_encoding"),
+]
+
+
+class TestUnencodableText:
+    """A Python str can hold unpaired surrogates (surrogateescape, JSON, Windows APIs), which
+    UTF-8 cannot encode: such records are invalid like any other, not an encoding crash."""
+
+    @pytest.mark.parametrize(("record", "code"), UNENCODABLE)
+    def test_rejected_with_a_validation_error(self, record: Any, code: str) -> None:
+        assert rejected(make(), record).code == code
+
+    @pytest.mark.parametrize(("record", "code"), UNENCODABLE)
+    def test_dropped_in_drop_mode_and_lock_nothing(self, record: Any, code: str) -> None:
+        serializer = make(on_invalid="drop")
+        good = {"measurement": "m", "fields": {"w": 2.0}, "time": T0}
+        chunk = serializer.serialize([record, good], database="db", precision="ns")
+        assert (chunk.lines, chunk.dropped) == ([f"m w=2.0 {T0}"], 1)
+        assert chunk.nbytes == len(chunk.lines[0]) + 1
+        assert [e.code for e in chunk.rejected] == [code]
+        assert serializer.locked_types("db", "m") == {"w": FieldType.FLOAT}
+
+    def test_the_rejected_string_field_is_named(self) -> None:
+        error = rejected(make(), {"measurement": "m", "fields": {"a": "ok", "b": UNPAIRED}})
+        assert (error.key, error.measurement) == ("b", "m")
+
+    def test_valid_non_ascii_text_is_counted_in_bytes(self) -> None:
+        chunk = make().serialize(
+            [{"measurement": "m", "tags": {"t": "é"}, "fields": {"s": "😀"}, "time": T0}],
+            database="db",
+            precision="ns",
+        )
+        assert chunk.nbytes == len(chunk.lines[0].encode()) + 1
+
+
+class TestIntAsFloat:
+    @pytest.mark.parametrize("coerce", [True, False])
+    def test_integer_fields_stay_integer(self, coerce: bool) -> None:
+        """int_as_float writes ints as floats unless the field is an integer field, declared
+        or locked (e.g. by sync_schema()): there they are integers, without coercion."""
+        declared = make(int_as_float=True, coerce=coerce, schemas={"m": {"fields": {"n": "integer"}}})
+        assert serialize(declared, {"measurement": "m", "fields": {"n": 5, "x": 7}}) == ["m n=5i,x=7.0"]
+        locked = make(int_as_float=True, coerce=coerce)
+        locked.seed_types("db", "m", {"n": FieldType.INTEGER})
+        assert serialize(locked, {"measurement": "m", "fields": {"n": np.int64(5)}}) == ["m n=5i"]
 
 
 class TestMisc:

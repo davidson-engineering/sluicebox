@@ -19,8 +19,8 @@ import math
 import operator
 import re
 import time
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -62,6 +62,7 @@ _FRAGMENT_CACHE_LIMIT = 200_000
 _TAGSET_CACHE_LIMIT = 50_000
 _TAGSET_CACHE_FILLS = 3
 _NO_COERCION: Any = object()
+_INTEGER_TYPES = (INTEGER, UINTEGER)
 
 _isfinite = math.isfinite
 
@@ -74,7 +75,7 @@ class SerializedChunk:
     nbytes: int
     dropped: int
     #: Why records were dropped (``on_invalid = "drop"``), in input order.
-    rejected: list[ValidationError] = field(default_factory=list)
+    rejected: Sequence[ValidationError] = ()
 
 
 class _Plan:
@@ -107,10 +108,10 @@ class _Plan:
         self.fields: dict[str, tuple[str, FieldType | None]] = {}
         #: Tag keys seen (tracked only where tag/field name overlap is forbidden).
         self.tag_keys: set[str] = set()
-        #: tuple(final tags.items()) -> serialized "measurement,k=v,..." head (None = disabled).
-        self.tagsets: dict[tuple[tuple[str, Any], ...], str] | None = {}
+        #: (*final tag keys, *their values) -> serialized "measurement,k=v,..." head (None = disabled).
+        self.tagsets: dict[tuple[Any, ...], str] | None = {}
         #: Same, keyed by the point's own tags when only (constant) static tags are injected.
-        self.static_tagsets: dict[tuple[tuple[str, Any], ...], str] | None = {}
+        self.static_tagsets: dict[tuple[Any, ...], str] | None = {}
         self.tagset_fills = 0
         self.rules = rules
         self.allowed_tags = schema.tags if schema else None
@@ -148,6 +149,11 @@ class Serializer:
         self._max_string_chars_fast = self._max_string // 4  # UTF-8 uses at most 4 bytes per char
         self._validate_raw = validation.raw_lines == "validate"
         self._check_overlap = dialect.forbid_tag_field_overlap
+        #: Per precision: (ns divisor, smallest plausible integer stamp, largest storable stamp).
+        self._precisions = {
+            name: (divisor, _PLAUSIBLE_NS // divisor, dialect.time_range(divisor)[1])
+            for name, divisor in PRECISION_DIVISORS.items()
+        }
         self._plans: dict[str, dict[str, _Plan]] = {}
         self._fragments: dict[tuple[str, str], str] = {}
         self._last_datetime: tuple[datetime | None, int] = (None, 0)
@@ -172,10 +178,9 @@ class Serializer:
         ``now_ns`` is the timestamp given to points without one (when ``auto_timestamp``);
         callers pass the same value for every chunk of one ``write()``.
         """
-        divisor = PRECISION_DIVISORS[precision]
-        # Integer timestamps in this range take the fast path; others are checked in _timestamp.
-        stamp_lo = _PLAUSIBLE_NS // divisor
-        stamp_hi = _INT64_MAX // divisor
+        # Integer timestamps from stamp_lo to stamp_hi take the fast path; others are checked in
+        # _timestamp.
+        divisor, stamp_lo, stamp_hi = self._precisions[precision]
         now = None
         if self.auto_timestamp:
             if now_ns is None:
@@ -185,7 +190,7 @@ class Serializer:
         append = lines.append
         nbytes = 0
         dropped = 0
-        rejected: list[ValidationError] = []
+        rejected: list[ValidationError] | None = None  # a list once a record is dropped
         index = start_index - 1
         # Untimed points of one call share the write() time: detect ones that would overwrite
         # each other (same series and field). Tracking starts lazily at the second such point.
@@ -204,7 +209,8 @@ class Serializer:
         injector = self.injector
         enrich = bool(injector.enrichers)
         static = bool(injector.static)
-        context_get = _CONTEXT_TAGS.get
+        # Context tags cannot change during the call (an enricher's own tag_context ends with it).
+        context = _CONTEXT_TAGS.get()
         int_as_float = self._int_as_float
         skip_non_finite = self._skip_non_finite
         max_chars = self._max_string_chars_fast
@@ -236,7 +242,8 @@ class Serializer:
                         append(line)
                     nbytes += raw.nbytes
                     dropped += raw.dropped
-                    rejected += raw.rejected
+                    if raw.rejected:
+                        rejected = [*(rejected or ()), *raw.rejected]
                     continue
                 else:
                     measurement, tags, fields, timestamp = self._unpack_other(record, database)
@@ -252,7 +259,6 @@ class Serializer:
                     tags = self._as_mapping(tags, "tags", measurement)
 
                 # -- tags: injection, then the cached serialized tag set ------------------------------
-                context = context_get()
                 if plan.rules or enrich or context is not None:
                     # Content-dependent injection: cache by the final tags.
                     tags = injector.apply(measurement, tags, fields, plan.rules, context)
@@ -267,7 +273,8 @@ class Serializer:
                     injected = False
                 if tags or injected:
                     head = None
-                    signature: tuple[tuple[str, Any], ...] | None = tuple(tags.items()) if tags else ()
+                    # Keys, then values: one tuple, and distinct for distinct tag sets.
+                    signature: tuple[Any, ...] | None = (*tags, *tags.values()) if tags else ()
                     if cache is not None:
                         try:
                             head = cache.get(signature)  # type: ignore[arg-type]
@@ -349,8 +356,11 @@ class Serializer:
                     line = f"{head} {','.join(out)} {timestamp}"
                 else:
                     line = f"{head} {','.join(out)} {self._timestamp(timestamp, divisor, measurement)}"
+                if line.isascii():
+                    nbytes += len(line) + 1
+                else:
+                    nbytes += _utf8_size(line, fields, measurement) + 1
                 append(line)
-                nbytes += (len(line) if line.isascii() else len(line.encode("utf-8"))) + 1
                 if journal:
                     journal.clear()
             except ValidationError as error:
@@ -361,6 +371,8 @@ class Serializer:
                 if self._raise:
                     raise
                 dropped += 1
+                if rejected is None:
+                    rejected = []
                 rejected.append(error)
                 if self.on_drop is not None:
                     self.on_drop(error, 1)
@@ -378,6 +390,8 @@ class Serializer:
                 if self._raise:
                     raise invalid from None
                 dropped += 1
+                if rejected is None:
+                    rejected = []
                 rejected.append(invalid)
                 if self.on_drop is not None:
                     self.on_drop(invalid, 1)
@@ -390,7 +404,7 @@ class Serializer:
                 "Give such points timestamps (or distinguishing tags)",
                 overwritten,
             )
-        return SerializedChunk(lines, nbytes, dropped, rejected)
+        return SerializedChunk(lines, nbytes, dropped, rejected or ())
 
     def seed_types(self, database: str, measurement: str, types: Mapping[str, FieldType]) -> None:
         """Lock field types learned elsewhere (e.g. from the server's schema)."""
@@ -467,8 +481,8 @@ class Serializer:
         self,
         plan: _Plan,
         tags: Mapping[str, Any],
-        signature: tuple[tuple[str, Any], ...] | None,
-        cache: dict[tuple[tuple[str, Any], ...], str] | None,
+        signature: tuple[Any, ...] | None,
+        cache: dict[tuple[Any, ...], str] | None,
         static_cache: bool,
         journal: list[tuple[Any, Any]] | None = None,
     ) -> str:
@@ -721,7 +735,7 @@ class Serializer:
                 return None
             return self._typed(plan, key, value, FLOAT, journal)
         if kind is int:
-            return self._typed(plan, key, value, FLOAT if self._int_as_float else INTEGER, journal)
+            return self._typed(plan, key, value, self._int_type(plan, key), journal)
         if kind is str:
             return self._typed(plan, key, value, STRING, journal)
         if kind is bool:
@@ -729,6 +743,13 @@ class Serializer:
         if value is None:
             return None
         return self._other_field(plan, key, value, journal)
+
+    def _int_type(self, plan: _Plan, key: str) -> FieldType:
+        """The type an int is written as: a float with ``int_as_float``, unless the field is an
+        integer field (declared, or locked from earlier values or the server's schema)."""
+        if self._int_as_float and plan.types.get(key) not in _INTEGER_TYPES:
+            return FLOAT
+        return INTEGER
 
     def _non_finite(self, plan: _Plan, key: str, value: float) -> None:
         """Skip a NaN/inf field (returns) or reject the record (raises), per validation.non_finite."""
@@ -861,7 +882,7 @@ class Serializer:
                 return None
             return self._typed(plan, key, value, FLOAT, journal)
         if isinstance(value, int):
-            return self._typed(plan, key, int(value), FLOAT if self._int_as_float else INTEGER, journal)
+            return self._typed(plan, key, int(value), self._int_type(plan, key), journal)
         if isinstance(value, str):
             return self._typed(plan, key, str(value), STRING, journal)
         raise ValidationError(
@@ -906,7 +927,7 @@ class Serializer:
                     f"timestamp {value!r} is not finite", code="invalid_time", measurement=measurement
                 )
             nanos = round(value * 1e9)
-            if not _INT64_MIN <= nanos <= _INT64_MAX:
+            if not self.dialect.min_time_ns <= nanos <= self.dialect.max_time_ns:
                 raise ValidationError(
                     f"float timestamp {value!r} is out of range: float timestamps are epoch seconds "
                     "(use an int in the write precision for other units)",
@@ -934,7 +955,11 @@ class Serializer:
                     nanos = None if micros == _NAT else micros * 1000
             except (OverflowError, ValueError):
                 nanos = None
-            if nanos is None or nanos == _NAT or not _INT64_MIN < nanos <= _INT64_MAX:
+            if (
+                nanos is None
+                or nanos == _NAT
+                or not self.dialect.min_time_ns <= nanos <= self.dialect.max_time_ns
+            ):
                 raise ValidationError(
                     f"timestamp {value} is outside the range InfluxDB can store (years 1677 to 2262)",
                     code="invalid_time",
@@ -947,9 +972,8 @@ class Serializer:
             f"unsupported timestamp type {type(value).__name__}", code="invalid_time", measurement=measurement
         )
 
-    @staticmethod
-    def _check_nanos(nanos: int, value: Any, measurement: str) -> None:
-        if not _INT64_MIN <= nanos <= _INT64_MAX:
+    def _check_nanos(self, nanos: int, value: Any, measurement: str) -> None:
+        if not self.dialect.min_time_ns <= nanos <= self.dialect.max_time_ns:
             raise ValidationError(
                 f"timestamp {value} is outside the range InfluxDB can store (years 1677 to 2262)",
                 code="invalid_time",
@@ -959,7 +983,8 @@ class Serializer:
     def _int_timestamp(self, stamp: int, divisor: int, measurement: str) -> int:
         """An integer timestamp outside the fast path's range: reject or warn."""
         unit = _PRECISION_NAMES[divisor]
-        if not _INT64_MIN // divisor <= stamp <= _INT64_MAX // divisor:
+        lowest, highest = self.dialect.time_range(divisor)
+        if not lowest <= stamp <= highest:
             raise ValidationError(
                 f"timestamp {stamp} with precision {unit!r} is outside the range InfluxDB can store; "
                 "is the precision right?",
@@ -1084,7 +1109,13 @@ class Serializer:
             if text.isascii():
                 nbytes = sum(map(len, candidates))
             else:
-                nbytes = sum(len(line.encode("utf-8")) for line in candidates)
+                try:
+                    nbytes = sum(len(line.encode("utf-8")) for line in candidates)
+                except UnicodeEncodeError:
+                    raise ValidationError(
+                        "line protocol must be valid Unicode, but contains an unpaired surrogate",
+                        code="invalid_encoding",
+                    ) from None
             return SerializedChunk(candidates, nbytes + len(candidates), 0)
         records = []
         for line in candidates:
@@ -1120,6 +1151,32 @@ def _with_timestamp(line: str, stamp: str) -> str:
     if tail.isdigit() or (tail[:1] == "-" and tail[1:].isdigit()):
         return line
     return body + stamp
+
+
+def _utf8_size(line: str, fields: Mapping[str, Any], measurement: str) -> int:
+    """UTF-8 size of a non-ASCII ``line``; rejects string field values UTF-8 cannot encode.
+
+    A Python str may hold unpaired surrogates (from ``surrogateescape``, JSON or Windows
+    APIs). Names and tag values were checked when first seen, so a string field is the cause.
+    """
+    try:
+        return len(line.encode("utf-8"))
+    except UnicodeEncodeError:
+        key = next((k for k, v in fields.items() if isinstance(v, str) and not _encodable(v)), None)
+        raise ValidationError(
+            "string field value must be valid Unicode, but contains an unpaired surrogate",
+            code="invalid_encoding",
+            measurement=measurement,
+            key=key,
+        ) from None
+
+
+def _encodable(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _written_keys(fields: Mapping[str, Any]) -> set[Any]:

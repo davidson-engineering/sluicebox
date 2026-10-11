@@ -8,6 +8,8 @@ InfluxDB 2 and 3 disagree on backslashes (verified against InfluxDB 2.9 and 3.12
 * InfluxDB 3 also unescapes ``\\\\`` to ``\\``; a literal backslash before a special
   character is only representable by doubling it.
 * Both reject names and tag values ending in a backslash, and line endings other than ``\\n``.
+* InfluxDB 2 stores timestamps from ``-2**63 + 2`` to ``2**63 - 2`` ns, and one line outside
+  that range fails its whole request; InfluxDB 3 accepts every int64.
 * A line starting with ``#`` is a comment: InfluxDB 2 silently drops a point whose
   measurement starts with ``#`` (escaping does not help), so such names are invalid.
 * InfluxDB 2 accepts measurement names containing ``=`` but its storage engine cannot
@@ -26,7 +28,8 @@ from typing import Any, Literal
 
 __all__ = ["Dialect", "ParsedLine", "UInt", "parse_line"]
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+#: Control characters, and unpaired surrogates (a Python str may hold them; UTF-8 cannot).
+_UNWRITABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
 STRING_ESCAPES = str.maketrans({'"': '\\"', "\\": "\\\\"})
 
 
@@ -55,10 +58,17 @@ class Dialect:
     measurement_specials: str
     #: Matches one line from its start up to (not including) its terminating newline.
     line_pattern: re.Pattern[str]
+    #: The range of timestamps (ns since the epoch) the server stores.
+    min_time_ns: int
+    max_time_ns: int
 
     @classmethod
     def for_version(cls, version: int) -> Dialect:
         return _V3 if version == 3 else _V2
+
+    def time_range(self, divisor: int) -> tuple[int, int]:
+        """The storable timestamps in units of ``divisor`` ns (inclusive, rounded inward)."""
+        return -(-self.min_time_ns // divisor), self.max_time_ns // divisor
 
     def escape_measurement(self, name: str) -> str:
         return name.translate(self.measurement_escapes)
@@ -80,9 +90,12 @@ class Dialect:
             return None if allow_empty else "must not be empty"
         if text[-1] == "\\":
             return "must not end with a backslash (InfluxDB rejects it)"
-        bad = _CONTROL.search(text)
+        bad = _UNWRITABLE.search(text)
         if bad is not None:
-            return f"must not contain control character {bad.group()!r}"
+            char = bad.group()
+            if char >= "\ud800":
+                return f"must be valid Unicode, but contains the unpaired surrogate {char!r}"
+            return f"must not contain control character {char!r}"
         return None
 
     # -- parsing ---------------------------------------------------------------------------
@@ -171,6 +184,8 @@ _V2 = Dialect(
     forbid_tag_field_overlap=False,
     measurement_specials=",= ",
     line_pattern=_line_pattern(r"\\[,= ]"),  # other backslashes are literal
+    min_time_ns=-(2**63) + 2,
+    max_time_ns=2**63 - 2,
 )
 _V3 = Dialect(
     version=3,
@@ -181,6 +196,8 @@ _V3 = Dialect(
     forbid_tag_field_overlap=True,
     measurement_specials=", ",
     line_pattern=_line_pattern(r"\\[^\n]"),
+    min_time_ns=-(2**63),
+    max_time_ns=2**63 - 1,
 )
 
 

@@ -275,29 +275,52 @@ class InfluxClient:
         field_columns: Sequence[str] | None,
         time_column: str | None,
     ) -> WriteFuture:
-        kind = type(data)
-        if (kind is dict or kind is Point) and measurement is None:
-            return self._write_one(data, database, precision)
+        records = self._one_batch(data, measurement, tag_columns, field_columns, time_column)
+        if records is not None:
+            return self._write_records(records, database, precision)
         chunks = self._chunks(data, database, precision, measurement, tag_columns, field_columns, time_column)
         return self._submit(chunks, database, precision)
 
-    def _write_one(self, record: Any, database: str, precision: Precision) -> WriteFuture:
-        """Fast path for the common one-record call (no chunking machinery)."""
+    def _one_batch(
+        self,
+        data: Any,
+        measurement: str | None,
+        tag_columns: Sequence[str] | None,
+        field_columns: Sequence[str] | None,
+        time_column: str | None,
+    ) -> Sequence[Any] | None:
+        """``data`` as records if it is the common call that fits in one batch, else None.
+
+        A record, or a list or tuple of at most ``batch_size`` records, needs no chunking.
+        """
+        if measurement is None and tag_columns is None and field_columns is None and time_column is None:
+            kind = type(data)
+            if kind is dict or kind is Point:
+                return (data,)
+            if (kind is list or kind is tuple) and len(data) <= self._chunk_size:
+                return data  # type: ignore[no-any-return]
+        return None
+
+    def _write_records(self, records: Sequence[Any], database: str, precision: Precision) -> WriteFuture:
+        """Records that fit in one batch: one serialize() and one submit(), no chunking machinery."""
         started = time.perf_counter()
         try:
-            chunk = self._serializer.serialize((record,), database=database, precision=precision)
+            chunk = self._serializer.serialize(records, database=database, precision=precision)
         except ValidationError as error:
             self._metrics.error("write", error)
             raise
         elapsed = time.perf_counter() - started
         future = WriteFuture(self._engine)
-        future.dropped = chunk.dropped
-        future.rejected = chunk.rejected
-        if chunk.lines and not self._engine.submit(
-            database, precision, chunk.lines, chunk.nbytes, future, serialize_time=elapsed
+        if chunk.dropped:
+            future.dropped = chunk.dropped
+            future.rejected = chunk.rejected[:MAX_REJECTED]
+        if not chunk.lines:
+            future._seal()
+        elif not self._engine.submit(
+            database, precision, chunk.lines, chunk.nbytes, future, serialize_time=elapsed, seal=True
         ):
             future.dropped += len(chunk.lines)
-        future._seal()
+            future._seal()
         return future
 
     def _chunks(
@@ -441,7 +464,10 @@ class InfluxClient:
         kind = _SERVER_TYPES.get(server_type.lower())
         if kind is None:
             return
-        previous = self._serializer.relock(database, measurement, key, kind)
+        try:
+            previous = self._serializer.relock(database, measurement, key, kind)
+        except ValidationError:
+            return  # a measurement this client refuses to write (it came in as raw line protocol)
         if previous is not None:
             log.warning(
                 "the server stores field %r of %r as %s, but sluicebox had locked it as %s from an "
@@ -795,7 +821,7 @@ def _shorten(text: str, limit: int = 300) -> str:
 def _add_dropped(future: WriteFuture, chunk: SerializedChunk) -> None:
     future.dropped += chunk.dropped
     if chunk.rejected and len(future.rejected) < MAX_REJECTED:
-        future.rejected += chunk.rejected[: MAX_REJECTED - len(future.rejected)]
+        future.rejected = [*future.rejected, *chunk.rejected[: MAX_REJECTED - len(future.rejected)]]
 
 
 _TAG_SETTINGS = frozenset({"static", "from_env", "rules", "on_conflict"})

@@ -273,13 +273,18 @@ class TestAsync:
             async with AsyncInfluxClient(settings, registry=CollectorRegistry()) as client:
                 for i in range(40):
                     await client.write(
-                        [{"measurement": "m", "fields": {"v": float(j)}} for j in range(i * 5, i * 5 + 5)]
+                        [
+                            {"measurement": "m", "fields": {"v": float(j)}, "time": j + 1}
+                            for j in range(i * 5, i * 5 + 5)
+                        ]
                     )
                 await client.flush()
             task.cancel()
             return ticks
 
         assert asyncio.run(scenario()) > 5  # the loop kept running while writers waited for space
+        # Each write that waited for space was buffered once, after the wait.
+        assert sorted(fake.lines) == sorted(f"m v={float(j)} {j + 1}" for j in range(200))
 
 
 class TestQueryHelpers:
@@ -457,6 +462,34 @@ class TestUsability:
             assert [error.code for error in result.rejected] == ["no_fields"]
             assert client.stats().write.points_dropped == 1
 
+    @pytest.mark.parametrize("batch_size", [5_000, 1_000], ids=["one-batch", "several-batches"])
+    def test_rejected_records_are_capped_but_counted(
+        self, fake: FakeInflux, make_settings: Callable[..., Any], batch_size: int
+    ) -> None:
+        settings = make_settings(
+            url=fake.url, validation={"on_invalid": "drop"}, write={"batch_size": batch_size}
+        )
+        records = [
+            {"measurement": "m", "fields": {} if i % 2 else {"v": 1.0}, "time": i + 1} for i in range(3000)
+        ]
+        with InfluxClient(settings, registry=CollectorRegistry()) as client:
+            result = client.write(records).result(timeout=5)
+        assert (result.points, result.dropped, len(result.rejected)) == (1500, 1500, 1000)
+        assert [error.index for error in result.rejected[:3]] == [1, 3, 5]
+
+    @pytest.mark.parametrize(
+        "data",
+        [{"measurement": "m", "fields": {"v": 1.0}}, [{"measurement": "m", "fields": {"v": 1.0}}], "m v=1"],
+        ids=["record", "list", "line-protocol"],
+    )
+    @pytest.mark.parametrize("option", ["measurement", "tag_columns", "field_columns", "time_column"])
+    def test_dataframe_options_are_refused_for_other_data(
+        self, client: InfluxClient, data: Any, option: str
+    ) -> None:
+        value = "m" if option in ("measurement", "time_column") else ["x"]
+        with pytest.raises(TypeError, match="only apply to DataFrames"):
+            client.write(data, **{option: value})
+
 
 class TestQueryUsability:
     def test_empty_influxdb2_result_converts(self) -> None:
@@ -497,3 +530,22 @@ class TestQueryUsability:
                 self.message = "boom"
 
         assert type(_map_v2_error(ApiError(), "q")).__name__ == kind
+
+    def test_influxdb2_results_may_hold_the_longest_strings(self) -> None:
+        """Flux results are CSV: Python's csv module refuses fields over 128 KiB by default,
+        but InfluxDB stores strings of up to 1 MiB. The (process-wide) limit is only raised."""
+        import csv
+
+        from sluicebox.query import _allow_long_csv_fields
+
+        original = csv.field_size_limit()
+        try:
+            csv.field_size_limit(131_072)
+            _allow_long_csv_fields()
+            value = "x" * (2 * 1024 * 1024)  # 1 MiB of quotes, each doubled by CSV escaping
+            assert next(csv.reader([f'"{value}"'])) == [value]
+            csv.field_size_limit(2**30)
+            _allow_long_csv_fields()
+            assert csv.field_size_limit() == 2**30
+        finally:
+            csv.field_size_limit(original)

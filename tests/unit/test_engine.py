@@ -474,3 +474,50 @@ class TestConcurrency:
         stats = client.stats().write
         assert stats.points_written == threads_count * per_thread
         assert stats.buffered_bytes == 0
+
+    def test_every_future_completes_once_however_it_is_awaited(
+        self, fake: FakeInflux, client_for: Any
+    ) -> None:
+        """result(), done-callbacks and await, registered from many threads while batches
+        complete on the senders: each future reports its outcome exactly once."""
+        import asyncio
+        import random
+
+        fake.responder = lambda _: Reply(delay=random.random() * 0.002)
+        client = client_for(write={"batch_size": 20, "concurrency": 4, "flush_interval": 0.001})
+        threads_count, per_thread = 8, 150
+        outcomes = [[0] * per_thread for _ in range(threads_count)]
+        errors: list[BaseException] = []
+
+        def count(t: int, i: int) -> None:
+            outcomes[t][i] += 1
+
+        async def wait(future: Any) -> Any:
+            return await asyncio.wait_for(future, 10)
+
+        def worker(t: int) -> None:
+            choose = random.Random(t).random
+            try:
+                for i in range(per_thread):
+                    future = client.write({"measurement": "m", "fields": {"v": 1.0}, "time": t * 10**6 + i})
+                    mode = choose()
+                    if mode < 0.4:
+                        future.add_done_callback(lambda f, t=t, i=i: count(t, i))
+                    elif mode < 0.8:
+                        assert future.result(timeout=10).points == 1
+                        count(t, i)
+                    else:
+                        assert asyncio.run(wait(future)).points == 1
+                        count(t, i)
+            except BaseException as error:  # pragma: no cover - reported below
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(threads_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        client.flush(timeout=30)
+        assert not errors
+        assert outcomes == [[1] * per_thread for _ in range(threads_count)]
+        assert len(fake.lines) == threads_count * per_thread

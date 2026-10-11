@@ -14,6 +14,7 @@ code only needs non-blocking entry points. Nothing here blocks the event loop:
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Self
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Self
 from ._engine import WouldBlock, WriteFailure
 from .client import ClientStats, InfluxClient, ServerInfo, _add_dropped
 from .exceptions import BufferFullError, ClientClosedError, ValidationError
-from .futures import WriteFuture
+from .futures import MAX_REJECTED, WriteFuture
 from .point import Point
 from .tags import Enricher, tag_context
 from .types import PRECISION_DIVISORS
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 
     from prometheus_client import CollectorRegistry
 
+    from ._serializer import SerializedChunk
     from .config import InfluxSettings
     from .query import Language, QueryResult
     from .types import FieldType, Precision
@@ -42,6 +44,8 @@ __all__ = ["AsyncInfluxClient"]
 _DONE: Any = object()
 #: Writes that never need to suspend still yield to the event loop every this many calls.
 _YIELD_EVERY = 32
+#: Lists up to this long are serialized on the event loop (about a millisecond at most).
+_INLINE_RECORDS = 1_000
 
 
 class AsyncInfluxClient:
@@ -134,35 +138,90 @@ class AsyncInfluxClient:
         prec = precision or client._precision
         if prec not in PRECISION_DIVISORS:
             raise ValueError(f"precision must be one of 'ns', 'us', 'ms', 's'; got {prec!r}")
-        engine = client._engine
         with tag_context(**tags) if tags else nullcontext():
-            chunks = client._chunks(data, target, prec, measurement, tag_columns, field_columns, time_column)
-            offload = _is_large(data, client._chunk_size)
-            future = WriteFuture(engine)
-            try:
-                while True:
-                    item = await asyncio.to_thread(next, chunks, _DONE) if offload else next(chunks, _DONE)
-                    if item is _DONE:
-                        break
-                    _add_dropped(future, item)
-                    while True:
-                        try:
-                            if not engine.submit(target, prec, item.lines, item.nbytes, future, block=False):
-                                future.dropped += len(item.lines)
-                            break
-                        except WouldBlock:
-                            await asyncio.to_thread(engine.wait_for_space, item.nbytes)
-            except (ValidationError, BufferFullError, ClientClosedError) as error:
-                error.points_enqueued = future.points
-                raise
-            finally:
-                future._seal()
-        if not offload:
+            records = client._one_batch(data, measurement, tag_columns, field_columns, time_column)
+            if records is not None and len(records) <= _INLINE_RECORDS:
+                inline = True
+                future = await self._write_records(records, target, prec)
+            else:
+                inline = not _is_large(data, client._chunk_size)
+                chunks = client._chunks(
+                    data, target, prec, measurement, tag_columns, field_columns, time_column
+                )
+                future = await self._write_chunks(chunks, target, prec, offload=not inline)
+        if inline:
             # A coroutine that never suspends starves the event loop: yield now and then.
             self._unyielded += 1
             if self._unyielded >= _YIELD_EVERY:
                 self._unyielded = 0
                 await asyncio.sleep(0)
+        return future
+
+    async def _write_records(
+        self, records: Sequence[Any], database: str, precision: Precision
+    ) -> WriteFuture:
+        """Records that fit in one batch, serialized on the loop (they take microseconds)."""
+        client = self._client
+        engine = client._engine
+        started = time.perf_counter()
+        try:
+            chunk = client._serializer.serialize(records, database=database, precision=precision)
+        except ValidationError as error:
+            client._metrics.error("write", error)
+            raise
+        elapsed = time.perf_counter() - started
+        future = WriteFuture(engine)
+        if chunk.dropped:
+            future.dropped = chunk.dropped
+            future.rejected = chunk.rejected[:MAX_REJECTED]
+        while chunk.lines:
+            try:
+                if engine.submit(
+                    database,
+                    precision,
+                    chunk.lines,
+                    chunk.nbytes,
+                    future,
+                    block=False,
+                    serialize_time=elapsed,
+                    seal=True,
+                ):
+                    return future  # buffered, and sealed with its lines
+                future.dropped += len(chunk.lines)  # on_full = "drop"
+                break
+            except WouldBlock:
+                await asyncio.to_thread(engine.wait_for_space, chunk.nbytes)
+        future._seal()
+        return future
+
+    async def _write_chunks(
+        self, chunks: Iterator[SerializedChunk], database: str, precision: Precision, *, offload: bool
+    ) -> WriteFuture:
+        """Any other input, chunk by chunk (in a worker thread if ``offload``)."""
+        engine = self._client._engine
+        future = WriteFuture(engine)
+        try:
+            while True:
+                item = await asyncio.to_thread(next, chunks, _DONE) if offload else next(chunks, _DONE)
+                if item is _DONE:
+                    break
+                _add_dropped(future, item)
+                while True:
+                    try:
+                        if not engine.submit(
+                            database, precision, item.lines, item.nbytes, future, block=False
+                        ):
+                            future.dropped += len(item.lines)
+                        break
+                    except WouldBlock:
+                        await asyncio.to_thread(engine.wait_for_space, item.nbytes)
+        except (ValidationError, BufferFullError, ClientClosedError) as error:
+            error.points_enqueued = future.points
+            if isinstance(error, ValidationError):
+                self._client._metrics.error("write", error)
+            raise
+        finally:
+            future._seal()
         return future
 
     async def flush(self, timeout: float | None = None) -> None:
@@ -260,7 +319,7 @@ def _is_large(data: Any, chunk_size: int) -> bool:
     if isinstance(data, Mapping | Point) or hasattr(type(data), "__sluicebox_model__"):
         return False
     if isinstance(data, list | tuple):
-        return len(data) > 1_000
+        return len(data) > _INLINE_RECORDS
     if type(data).__name__ in ("DataFrame", "LazyFrame"):
         return True
     return not hasattr(data, "__len__") or len(data) > min(1_000, chunk_size)

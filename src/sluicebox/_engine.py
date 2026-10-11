@@ -17,9 +17,9 @@ Threads are daemons, started on first use, re-created after ``fork()``, and the 
 flushed at interpreter exit (``write.flush_on_exit``).
 
 Fork safety: a child process starts with only the thread that called ``fork()``. The engine
-locks and the futures lock are held across ``fork()``, so the child inherits consistent,
-unlocked state; the child then forgets the parent's buffers, threads and connections and
-fails the futures of data the parent is sending.
+locks (which also guard the engines' futures) are held across ``fork()``, so the child
+inherits consistent, unlocked state; the child then forgets the parent's buffers, threads and
+connections and fails the futures of data the parent is sending.
 """
 
 from __future__ import annotations
@@ -130,16 +130,18 @@ class EngineStats:
 
 class _Batch:
     __slots__ = (
+        "counts",
         "created",
         "database",
         "finished",
+        "futures",
         "lines",
         "nbytes",
+        "offsets",
         "precision",
         "sealed",
         "seqs",
         "serialize_time",
-        "waiters",
     )
 
     def __init__(self, database: str, precision: str) -> None:
@@ -149,8 +151,13 @@ class _Batch:
         self.nbytes = 0
         #: Caller-thread time spent serializing the lines of this batch (recorded once per batch).
         self.serialize_time = 0.0
-        #: (future, first line index in this batch, line count, offset within the future's lines)
-        self.waiters: list[tuple[WriteFuture, int, int, int]] = []
+        #: The futures of the write() calls with lines here, in line order: each call's lines
+        #: follow the previous call's. ``counts`` holds how many lines each has in this batch,
+        #: ``offsets`` how many of its lines earlier batches carry. (Three lists rather than a
+        #: tuple per call: no object per buffered write for the garbage collector to scan.)
+        self.futures: list[WriteFuture] = []
+        self.counts: list[int] = []
+        self.offsets: list[int] = []
         self.created = time.monotonic()
         self.sealed = 0.0
         #: Sequence numbers in ``_outstanding``: one per sealed batch merged into this one.
@@ -346,13 +353,18 @@ class WriteEngine:
         *,
         block: bool = True,
         serialize_time: float = 0.0,
+        seal: bool = False,
     ) -> bool:
         """Buffer ``lines`` for ``future``. Returns False if they were dropped (buffer full).
 
         With ``block=False`` a full buffer under the ``block`` policy raises :class:`WouldBlock`
         (nothing is buffered) so asyncio callers can wait elsewhere via :meth:`wait_for_space`.
+        ``seal=True`` marks these as the last lines of the call, sealing the future with them
+        (the caller seals it on a False return or an exception).
         """
         if not lines:
+            if seal:
+                future._seal()
             return True
         with self._lock:
             if self._closing:
@@ -389,16 +401,12 @@ class WriteEngine:
             if count > self._batch_size or nbytes > self._max_batch_bytes:
                 # Lines are re-measured there: count exactly what the batches hold, since
                 # _finish releases batch.nbytes.
-                self._pending_bytes += self._submit_split(key, lines, future)
+                self._pending_bytes += self._submit_split(key, lines, future, seal)
             else:
                 self._pending_bytes += nbytes
                 if batch is None:
                     batch = self._new_open_batch(key)
-                batch.waiters.append((future, len(batch.lines), count, future.points))
-                future._attach()
-                future.points += count
-                batch.lines += lines
-                batch.nbytes += nbytes
+                self._fill(batch, lines, nbytes, future, seal)
                 batch.serialize_time += serialize_time
                 if len(batch.lines) >= self._batch_size or batch.nbytes >= self._max_batch_bytes:
                     self._seal(key, batch)
@@ -410,7 +418,7 @@ class WriteEngine:
             self._flusher_wake.notify()
         return batch
 
-    def _submit_split(self, key: tuple[str, str], lines: list[str], future: WriteFuture) -> int:
+    def _submit_split(self, key: tuple[str, str], lines: list[str], future: WriteFuture, seal: bool) -> int:
         """Cut an oversized submission into batches that respect both size limits.
 
         Returns the bytes added to batches (UTF-8, newlines included).
@@ -431,15 +439,17 @@ class WriteEngine:
             total += size
         if piece:
             batch = self._new_open_batch(key)
-            self._fill(batch, piece, piece_bytes, future)
+            self._fill(batch, piece, piece_bytes, future, seal)
             if len(batch.lines) >= self._batch_size or batch.nbytes >= self._max_batch_bytes:
                 self._seal(key, batch)
         return total
 
     @staticmethod
-    def _fill(batch: _Batch, lines: list[str], nbytes: int, future: WriteFuture) -> None:
-        batch.waiters.append((future, len(batch.lines), len(lines), future.points))
-        future._attach()
+    def _fill(batch: _Batch, lines: list[str], nbytes: int, future: WriteFuture, seal: bool = False) -> None:
+        batch.futures.append(future)
+        batch.counts.append(len(lines))
+        batch.offsets.append(future.points)
+        future._attach(seal)
         future.points += len(lines)
         batch.lines += lines
         batch.nbytes += nbytes
@@ -621,15 +631,17 @@ class WriteEngine:
                 batch = self._take()
                 self._sending.add(batch)
                 inflight = len(self._sending)
-            self._metrics.inflight(inflight)
-            outcome: _Outcome | None = None
+            # Never let a sender thread die: with all of them gone, nothing would be sent again.
             try:
+                self._metrics.inflight(inflight)
                 outcome = self._process(batch)
-            except BaseException as exc:  # never let a sender thread die
+            except BaseException as exc:
                 log.exception("unexpected error while sending a batch")
                 outcome = _Outcome(failures=[_Failure(0, len(batch.lines), exc)])
-            finally:
+            try:
                 self._finish(batch, outcome)
+            except BaseException:
+                log.exception("unexpected error while finishing a write batch")
 
     def _take(self) -> _Batch:
         """Dequeue the next batch to send (lock held, queue not empty).
@@ -668,10 +680,9 @@ class WriteEngine:
     @staticmethod
     def _merge(batch: _Batch, other: _Batch) -> None:
         """Append the lines of ``other`` (and all its bookkeeping) to ``batch``."""
-        base = len(batch.lines)
-        batch.waiters += [
-            (future, base + start, count, offset) for future, start, count, offset in other.waiters
-        ]
+        batch.futures += other.futures
+        batch.counts += other.counts
+        batch.offsets += other.offsets
         batch.lines += other.lines
         batch.nbytes += other.nbytes
         batch.serialize_time += other.serialize_time
@@ -728,13 +739,19 @@ class WriteEngine:
             self._send_range(batch, lines[:middle], base, outcome)
             self._send_range(batch, lines[middle:], base + middle, outcome)
         except PartialWriteError as exc:
-            numbered = [err for err in exc.line_errors if 1 <= err.line_number <= len(lines)]
-            if numbered:
-                for err in numbered:
-                    index = base + err.line_number - 1
-                    outcome.failures.append(_Failure(index, index + 1, exc, err))
+            numbers = [err.line_number for err in exc.line_errors]
+            if numbers and all(1 <= number <= len(lines) for number in numbers):
+                reported: set[int] = set()
+                for err in exc.line_errors:
+                    if err.line_number not in reported:
+                        reported.add(err.line_number)
+                        index = base + err.line_number - 1
+                        outcome.failures.append(_Failure(index, index + 1, exc, err))
             else:
-                rejected = exc.rejected if exc.rejected else len(lines)
+                # Not every rejection names a line of this request: report the whole request as
+                # failed rather than count unidentified rejected lines as written (replaying
+                # stored lines is harmless, as every point carries its timestamp).
+                rejected = max(len(exc.line_errors), exc.rejected or 0) or len(lines)
                 outcome.failures.append(
                     _Failure(base, base + len(lines), exc, failed=min(rejected, len(lines)))
                 )
@@ -842,13 +859,14 @@ class WriteEngine:
             limit,
         )
 
-    def _finish(self, batch: _Batch, outcome: _Outcome | None) -> None:
+    def _finish(self, batch: _Batch, outcome: _Outcome) -> None:
         """Report a processed batch, resolve its futures, then release it.
 
         Futures and ``on_error`` handlers run *before* the batch stops counting as
-        outstanding, so a ``flush()`` that returns has seen all of their side effects.
+        outstanding, so a ``flush()`` that returns has seen all of their side effects. A
+        failure while reporting (metrics, logging, learning server types) never keeps the
+        futures from being resolved or the batch from being released.
         """
-        assert outcome is not None
         with self._lock:
             if batch.finished:  # close() gave up on this request and reported it already
                 return
@@ -857,44 +875,27 @@ class WriteEngine:
         total = len(batch.lines)
         failed_lines = min(total, sum(failure.failed for failure in outcome.failures))
         written = total - failed_lines
-        elapsed = time.monotonic() - batch.created
+        finished = time.monotonic()
+        elapsed = finished - batch.created
         raw_bytes = batch.nbytes
-        self._stages.record("batch", elapsed)
-        if batch.serialize_time:
-            self._stages.record("serialize", batch.serialize_time)
         try:
-            if not outcome.failures:
-                self._metrics.batch_succeeded(batch.database, total, raw_bytes, outcome.bytes_sent, elapsed)
-                for future, _start, _count, _offset in batch.waiters:
-                    future._batch_done(None)
-                if self._slow_batch is not None and elapsed > self._slow_batch:
-                    self._rate_log.log(
-                        "slow_batch",
-                        logging.WARNING,
-                        "slow write batch: %d points to %r took %.2f s from buffering to acknowledgement",
-                        total,
-                        batch.database,
-                        elapsed,
-                    )
-                else:
-                    log.debug("wrote %d points to %r in %.1f ms", total, batch.database, elapsed * 1000)
-            else:
-                first = outcome.failures[0].error
-                self._metrics.batch_failed(
-                    batch.database, failed_lines, "partial" if written else "failed", first
-                )
-                if written:
-                    self._metrics.points_partially_rejected(batch.database, written, 0)
+            try:
+                self._observe(batch, outcome, elapsed, written, failed_lines)
+            except Exception:
+                log.exception("error while recording the metrics of a write batch")
+            errors: list[BaseException | None] | None = None
+            if outcome.failures:
                 handled = self._report(batch, outcome, failed_lines)
                 self._learn_types(batch, outcome.failures)
-                affected = []
-                for future, start, count, offset in batch.waiters:
-                    error = self._future_error(batch.lines, outcome.failures, start, count, offset)
-                    if error is not None:
-                        affected.append(future)
-                    future._batch_done(error)
+                errors = []
+                start = 0
+                for count, offset in zip(batch.counts, batch.offsets, strict=True):
+                    errors.append(self._future_error(batch.lines, outcome.failures, start, count, offset))
+                    start += count
                 if not handled:
-                    unreported = _Unreported(first, failed_lines, tuple(affected))
+                    affected = tuple(f for f, e in zip(batch.futures, errors, strict=True) if e is not None)
+                    unreported = _Unreported(outcome.failures[0].error, failed_lines, affected)
+            self._resolve_futures(batch.futures, errors, finished)
         finally:
             with self._lock:
                 self._sending.discard(batch)
@@ -921,6 +922,58 @@ class WriteEngine:
                 self._progress.notify_all()
             self._metrics.buffer(pending)
             self._metrics.inflight(inflight)
+
+    def _resolve_futures(
+        self, futures: list[WriteFuture], errors: list[BaseException | None] | None, now: float
+    ) -> None:
+        """Release a completed batch's futures (``errors``: one per future, or None for none).
+
+        Their state is updated under one hold of the engine lock; waiters are woken and
+        callbacks run after it, each on its own, so one callback cannot hold up the others.
+        """
+        with self._lock:
+            if errors is None:
+                notify = [future for future in futures if future._release(None, now)]
+            else:
+                notify = [
+                    future
+                    for future, error in zip(futures, errors, strict=True)
+                    if future._release(error, now)
+                ]
+        for future in notify:
+            try:
+                future._complete()
+            except BaseException:  # e.g. SystemExit from a callback (Exceptions are caught there)
+                log.exception("a write future callback raised")
+
+    def _observe(
+        self, batch: _Batch, outcome: _Outcome, elapsed: float, written: int, failed_lines: int
+    ) -> None:
+        """Stage timings, metrics and the slow-batch log of a processed batch."""
+        self._stages.record("batch", elapsed)
+        if batch.serialize_time:
+            self._stages.record("serialize", batch.serialize_time)
+        if outcome.failures:
+            first = outcome.failures[0].error
+            self._metrics.batch_failed(
+                batch.database, failed_lines, "partial" if written else "failed", first
+            )
+            if written:
+                self._metrics.points_partially_rejected(batch.database, written, 0)
+            return
+        total = len(batch.lines)
+        self._metrics.batch_succeeded(batch.database, total, batch.nbytes, outcome.bytes_sent, elapsed)
+        if self._slow_batch is not None and elapsed > self._slow_batch:
+            self._rate_log.log(
+                "slow_batch",
+                logging.WARNING,
+                "slow write batch: %d points to %r took %.2f s from buffering to acknowledgement",
+                total,
+                batch.database,
+                elapsed,
+            )
+        else:
+            log.debug("wrote %d points to %r in %.1f ms", total, batch.database, elapsed * 1000)
 
     @staticmethod
     def _future_error(
@@ -1006,7 +1059,12 @@ class WriteEngine:
             key = (measurement, match["field"], match["type"])
             if key not in learned:
                 learned.add(key)
-                self._on_type_conflict(batch.database, *key)
+                try:
+                    self._on_type_conflict(batch.database, *key)
+                except Exception:
+                    log.exception(
+                        "could not learn the type the server stores for field %r of %r", key[1], key[0]
+                    )
 
     # ------------------------------------------------------------------------------------
     # Lifecycle
@@ -1114,19 +1172,17 @@ class WriteEngine:
         self._init_state()
         self._transport.reset_after_fork()
         error = ClientClosedError("buffered in the parent process before fork(); the parent sends it")
+        now = time.monotonic()
         for batch in inherited:
-            for future, _start, _count, _offset in batch.waiters:
-                future._batch_done(error)
+            self._resolve_futures(batch.futures, [error] * len(batch.futures), now)
 
 
-# Locks held across fork(): the engines' (in a fixed order), then the futures lock, which
-# engine code takes while holding an engine lock.
+# The engines' locks (which also guard their futures) are held across fork(), in a fixed order.
 _held_across_fork: list[threading.Lock] = []
 
 
 def _before_fork() -> None:
     _held_across_fork[:] = [engine._lock for engine in list(_ENGINES)]
-    _held_across_fork.append(_futures._LOCK)
     for lock in _held_across_fork:
         lock.acquire()
 
@@ -1138,8 +1194,7 @@ def _after_fork_in_parent() -> None:
 
 
 def _release_in_child() -> None:
-    _futures._LOCK.release()  # the engine locks are replaced by _after_fork
-    _held_across_fork.clear()
+    _held_across_fork.clear()  # the engine locks are replaced by _after_fork
 
 
 def _reset_engines_in_child() -> None:
