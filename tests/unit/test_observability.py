@@ -457,6 +457,34 @@ class TestUsability:
             assert [error.code for error in result.rejected] == ["no_fields"]
             assert client.stats().write.points_dropped == 1
 
+    @pytest.mark.parametrize("batch_size", [5_000, 1_000], ids=["one-batch", "several-batches"])
+    def test_rejected_records_are_capped_but_counted(
+        self, fake: FakeInflux, make_settings: Callable[..., Any], batch_size: int
+    ) -> None:
+        settings = make_settings(
+            url=fake.url, validation={"on_invalid": "drop"}, write={"batch_size": batch_size}
+        )
+        records = [
+            {"measurement": "m", "fields": {} if i % 2 else {"v": 1.0}, "time": i + 1} for i in range(3000)
+        ]
+        with InfluxClient(settings, registry=CollectorRegistry()) as client:
+            result = client.write(records).result(timeout=5)
+        assert (result.points, result.dropped, len(result.rejected)) == (1500, 1500, 1000)
+        assert [error.index for error in result.rejected[:3]] == [1, 3, 5]
+
+    @pytest.mark.parametrize(
+        "data",
+        [{"measurement": "m", "fields": {"v": 1.0}}, [{"measurement": "m", "fields": {"v": 1.0}}], "m v=1"],
+        ids=["record", "list", "line-protocol"],
+    )
+    @pytest.mark.parametrize("option", ["measurement", "tag_columns", "field_columns", "time_column"])
+    def test_dataframe_options_are_refused_for_other_data(
+        self, client: InfluxClient, data: Any, option: str
+    ) -> None:
+        value = "m" if option in ("measurement", "time_column") else ["x"]
+        with pytest.raises(TypeError, match="only apply to DataFrames"):
+            client.write(data, **{option: value})
+
 
 class TestQueryUsability:
     def test_empty_influxdb2_result_converts(self) -> None:

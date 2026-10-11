@@ -263,9 +263,6 @@ class InfluxClient:
         if tags:
             with tag_context(**tags):
                 return self._write(data, target, prec, measurement, tag_columns, field_columns, time_column)
-        kind = type(data)
-        if (kind is dict or kind is Point) and measurement is None:
-            return self._write_one(data, target, prec)  # the most common call: one record
         return self._write(data, target, prec, measurement, tag_columns, field_columns, time_column)
 
     def _write(
@@ -278,17 +275,21 @@ class InfluxClient:
         field_columns: Sequence[str] | None,
         time_column: str | None,
     ) -> WriteFuture:
-        kind = type(data)
-        if (kind is dict or kind is Point) and measurement is None:
-            return self._write_one(data, database, precision)
+        if measurement is None and tag_columns is None and field_columns is None and time_column is None:
+            # The common calls: a record, or a list that fits in one batch.
+            kind = type(data)
+            if kind is dict or kind is Point:
+                return self._write_records((data,), database, precision)
+            if (kind is list or kind is tuple) and len(data) <= self._chunk_size:
+                return self._write_records(data, database, precision)
         chunks = self._chunks(data, database, precision, measurement, tag_columns, field_columns, time_column)
         return self._submit(chunks, database, precision)
 
-    def _write_one(self, record: Any, database: str, precision: Precision) -> WriteFuture:
-        """Fast path for the common one-record call (no chunking machinery)."""
+    def _write_records(self, records: Sequence[Any], database: str, precision: Precision) -> WriteFuture:
+        """Records that fit in one batch: one serialize() and one submit(), no chunking machinery."""
         started = time.perf_counter()
         try:
-            chunk = self._serializer.serialize((record,), database=database, precision=precision)
+            chunk = self._serializer.serialize(records, database=database, precision=precision)
         except ValidationError as error:
             self._metrics.error("write", error)
             raise
@@ -296,7 +297,7 @@ class InfluxClient:
         future = WriteFuture(self._engine)
         if chunk.dropped:
             future.dropped = chunk.dropped
-            future.rejected = chunk.rejected
+            future.rejected = chunk.rejected[:MAX_REJECTED]
         if not chunk.lines:
             future._seal()
         elif not self._engine.submit(
