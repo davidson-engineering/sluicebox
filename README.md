@@ -200,12 +200,17 @@ order, retries included.
 A batch that still fails after retries (or that the server rejects) is reported:
 
 - to the futures of the `write()` calls whose points it carried: `result()` / `await` raise
-  one error for the call, and `future.errors` lists every batch's error. For InfluxDB 3 partial
-  writes only the calls that contained a rejected line fail, and `PartialWriteError.line_errors`
-  gives each rejected line (as sent) and its number within that call;
-- to `on_error`, if given, once per failed batch, with the exact line protocol, ready to
+  one error for the call, and `future.errors` lists every batch's error. When the server
+  rejects single lines (InfluxDB 3 partial writes, and the lines InfluxDB 2, or InfluxDB 3 on
+  `/api/v2/write`, refuses a whole request for, see
+  [Server behaviour handled for you](#server-behaviour-handled-for-you)), the rest of the batch
+  is written and only the calls that contained a rejected line fail, with a `PartialWriteError`
+  whose `line_errors` give each rejected line (as sent) and its number within that call;
+- to `on_error`, if given, once per failed batch, with the exact line protocol that was not
+  written (just the rejected lines, when the server rejected single lines), ready to
   dead-letter and replay. `failure.retryable` tells transient failures (network, outage,
-  client closing) from data the server refused:
+  client closing) from data the server refused; it is true when some lines failed each way,
+  as replaying them writes those that failed transiently:
 
   ```python
   def dead_letter(failure: WriteFailure) -> None:
@@ -303,7 +308,7 @@ Every record is checked while it is serialized, before anything is buffered:
 | Field type lock (`type_lock`) | The first type written for a field is kept; later values must match. Safe coercions apply (`coerce`): int to float, integral float to int. Booleans never become numbers. A record that is rejected locks nothing, nor does a DataFrame write in which no row is written. |
 | Server types | When the server rejects a value because it stores the field with another type, the lock follows the server's type. `client.sync_schema()` learns all stored types up front. |
 | Declared schemas | `[measurements.<name>]`: field types, allowed and required tags, required fields, `extra_fields = "forbid"`. `unknown_measurements = "reject"` allows only declared measurements. |
-| Identifiers | Escaped per server version; names that cannot round-trip are rejected (trailing backslash, control characters, reserved keys, `#`-prefixed measurements, `=` in InfluxDB 2 measurement names, tag/field name clashes on InfluxDB 3). |
+| Identifiers | Escaped per server version; names that cannot round-trip are rejected (trailing backslash, control characters, reserved keys, `#`-prefixed measurements, `=` in InfluxDB 2 measurement names, tag/field name clashes on InfluxDB 3, and on InfluxDB 2 a backslash before a space, `,` or `=` where the line would then not end where it is written). |
 | Values | int64/uint64 ranges, 1 MiB strings, NaN/inf (`non_finite`: `skip` the field, like pandas' missing values, or reject the record with `error`), timezone-naive datetimes (`naive_datetime`: reject or treat as UTC), ints that `int_as_float` cannot represent exactly. |
 | Timestamps | Range (1677-2262), and a warning for integers that look like the wrong unit. |
 | Records | Unknown keys in record dicts (`"tag"` instead of `"tags"`), records without fields. |
@@ -324,7 +329,16 @@ Raw line protocol is passed through unchanged by default (fastest), except that 
 timestamp get the `write()` time like any other point; `raw_lines = "validate"` parses it so
 validation and tag injection apply too. Either way, a newline inside a quoted string field value
 belongs to the value, so the output of `to_line_protocol()` and `WriteFailure.lines` can be
-written back as is.
+written back as is. Lines are never sent if the server would read them together with the
+next line, which could be another `write()` call's: a line that leaves a string value open
+(`m s="cut 17000`, e.g. truncated) or ends in a backslash, or one whose multi-line string
+value is not followed by a valid end of line (a string left open, then closed by the quote
+of a later line). Those are
+`invalid_line`, also when passed through: on the server they would take the lines after them
+along, without an error (see [Server behaviour](#server-behaviour-handled-for-you)). Only
+lines with a quote or a backslash need this check. A str or bytes is one record, so with
+`on_invalid = "drop"` an invalid line drops the text it is in; write lines one by one, or as
+a list, to keep the others.
 
 ```toml
 [validation]
@@ -574,10 +588,40 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
 - InfluxDB 2 silently drops points whose measurement starts with `#` (a comment line), and
   stores but can never query measurement names containing `=`. Both are rejected client-side.
 - Names or tag values ending in a backslash, tabs in names (InfluxDB 3), NaN, int64 overflow,
-  timestamps beyond 2262 and strings over 1 MiB are rejected by the servers, often taking the
-  rest of the batch with them.
+  timestamps beyond 2262 and strings over 1 MiB are rejected by the servers. Validation rejects
+  them before they are sent.
+- InfluxDB 2 parses a whole request before storing any of it, so one line it cannot parse (raw
+  line protocol is sent unvalidated by default) fails the whole batch, other `write()` calls'
+  points included, and a replay of the dead-lettered batch fails again. Its HTTP 400 quotes each
+  such line: sluicebox takes those out and sends the rest again, so every valid line is written
+  and only the bad ones fail, each for its own `write()` call. When the quotes do not match
+  the lines sent, the request is halved instead, as for HTTP 413. This costs at most 64 extra
+  requests per batch, and a request the server may have partly stored is never resent.
+- Both servers end a line at a newline only outside string values, and take a backslash to
+  escape any character, the newline too. A line leaving a string value open, or ending in a
+  backslash, therefore runs on into the next line of the request: InfluxDB 3 neither stores
+  nor reports the lines it swallows (`write_lp` named 1 error for 3 lines, and stored 1 of the
+  3 valid ones), and InfluxDB 2 stores two such lines and the lines between as one point with
+  HTTP 204. Lines from many `write()` calls share a request, so `write()` rejects such lines
+  (`invalid_line`), unvalidated raw line protocol too. InfluxDB 2 writes the backslash of a
+  name like `a\ b` as `a\\ b`, which its line splitting reads as an escaped backslash and a
+  space; points whose lines it would then read differently are rejected (`invalid_name`).
 - On InfluxDB 3, `/api/v3/write_lp` (the default for version 3) keeps the valid lines of a batch
-  and names the rejected ones; `/api/v2/write` rejects the whole batch.
+  and names the rejected ones. `/api/v2/write` (`write.api = "v2"`) stores nothing of a request
+  with one line it cannot parse, or that gives a column another type than its table has, and
+  names the reason but not the line. sluicebox sends the lines that reason can be about (lines
+  it cannot parse either, or that give the column the refused type, a request per table)
+  apart from the others, which go in one request. Lines of one table that all give a field the
+  refused type fail together, and their type conflict teaches the client the server's type.
+  Otherwise the request is halved, which costs about
+  2 x log2(lines) requests per refused line: about 30 in a 25,000-line batch. This matters
+  because a request the server stores takes up to a second (it acknowledges on its WAL flush),
+  while one it refuses takes milliseconds. The same limit of 64 extra requests per batch
+  applies.
+- InfluxDB 3 Cloud Serverless, Dedicated and Clustered keep the valid lines of a request by
+  default (Serverless always), so after their HTTP 400 for some lines nothing is resent: the
+  whole request is reported as failed (replaying it is harmless, as every point carries its
+  timestamp).
 - Flux parameters (`params.x`) are a Cloud-only feature; sluicebox binds them so they work on OSS.
 
 ## Development

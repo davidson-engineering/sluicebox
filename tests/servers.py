@@ -12,7 +12,11 @@ import pytest
 from sluicebox import InfluxClient, load_settings
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from prometheus_client import CollectorRegistry
+
+    from sluicebox import WriteFailure
 
 #: Throwaway credentials that `docker compose up` generates for the test servers.
 SECRETS_DIR = Path(__file__).resolve().parents[1] / "docker" / "secrets"
@@ -58,7 +62,13 @@ def reachable(url: str) -> bool:
         return False
 
 
-def server_client(version: int, registry: CollectorRegistry, **overrides: Any) -> InfluxClient:
+def server_client(
+    version: int,
+    registry: CollectorRegistry,
+    *,
+    on_error: Callable[[WriteFailure], Any] | None = None,
+    **overrides: Any,
+) -> InfluxClient:
     url = V3_URL if version == 3 else V2_URL
     if not reachable(url):
         pytest.skip(f"InfluxDB {version} test server not running at {url} (docker compose up -d --wait)")
@@ -78,4 +88,4 @@ def server_client(version: int, registry: CollectorRegistry, **overrides: Any) -
         "write": {"flush_interval": 0.05},
     }
     settings = load_settings(None, env_file=None, **deep_merge(base, overrides))
-    return InfluxClient(settings, registry=registry)
+    return InfluxClient(settings, on_error=on_error, registry=registry)

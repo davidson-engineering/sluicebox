@@ -13,6 +13,7 @@ Run: uv run python benchmarks/bench_client.py [--points N] [--threads 2,4,8] [--
 from __future__ import annotations
 
 import argparse
+import functools
 import gc
 import gzip
 import hashlib
@@ -94,22 +95,37 @@ def make_points(n: int) -> list[dict[str, Any]]:
     ]
 
 
-def scenarios(thread_counts: list[int]) -> dict[str, Callable[[Any, list[dict[str, Any]]], None]]:
-    def records(client: Any, points: list[dict[str, Any]]) -> None:
+def make_lines(n: int, *, strings: bool) -> list[str]:
+    """Raw line protocol for points like make_points(), optionally with a string field (quoted)."""
+    state = ',state="ok {}"' if strings else ""
+    return [
+        f"cpu,host=host-{i % 100},region={('eu-west', 'us-east', 'ap-south')[i % 3]} "
+        f"usage_user={(i % 1000) / 10.0},usage_system={(i % 333) / 7.0},load={i % 17}i"
+        f"{state.format(i % 7)} {BASE_NS + i * 1000}"
+        for i in range(n)
+    ]
+
+
+#: What a scenario writes with the client, and the lines it must deliver (None: the points').
+Scenario = tuple["Callable[[Any], None]", "list[str] | None"]
+
+
+def scenarios(points: list[dict[str, Any]], thread_counts: list[int]) -> dict[str, Scenario]:
+    def records(client: Any) -> None:
         client.write(points)
 
-    def one_per_call(client: Any, points: list[dict[str, Any]]) -> None:
+    def one_per_call(client: Any, points: list[Any] = points) -> None:
         write = client.write
         for point in points:
             write(point)
 
-    def lists_of_10(client: Any, points: list[dict[str, Any]]) -> None:
+    def lists_of_10(client: Any) -> None:
         write = client.write
         for start in range(0, len(points), 10):
             write(points[start : start + 10])
 
-    def threaded(threads: int) -> Callable[[Any, list[dict[str, Any]]], None]:
-        def run(client: Any, points: list[dict[str, Any]]) -> None:
+    def threaded(threads: int) -> Callable[[Any], None]:
+        def run(client: Any) -> None:
             share = -(-len(points) // threads)
             workers = [
                 threading.Thread(target=one_per_call, args=(client, points[i * share : (i + 1) * share]))
@@ -122,19 +138,28 @@ def scenarios(thread_counts: list[int]) -> dict[str, Callable[[Any, list[dict[st
 
         return run
 
-    found = {
-        "write(list of dicts)": records,
-        "one write() per point": one_per_call,
-        "write() of 10 points at a time": lists_of_10,
+    found: dict[str, Scenario] = {
+        "write(list of dicts)": (records, None),
+        "one write() per point": (one_per_call, None),
+        "write() of 10 points at a time": (lists_of_10, None),
     }
     for threads in thread_counts:
-        found[f"one write() per point, {threads} threads"] = threaded(threads)
+        found[f"one write() per point, {threads} threads"] = (threaded(threads), None)
+    for strings in (False, True):
+        lines = make_lines(len(points), strings=strings)
+        quoted = ", string field" if strings else ""
+
+        def text(client: Any, lines: list[str] = lines) -> None:
+            client.write("\n".join(lines))
+
+        found[f"write(line protocol text){quoted}"] = (text, lines)
+        found[f"one write() per line{quoted}"] = (functools.partial(one_per_call, points=lines), lines)
     try:
         import polars as pl
     except ImportError:
         return found
 
-    def frame(client: Any, points: list[dict[str, Any]]) -> None:
+    def frame(client: Any) -> None:
         columns = {
             "host": [p["tags"]["host"] for p in points],
             "region": [p["tags"]["region"] for p in points],
@@ -143,7 +168,7 @@ def scenarios(thread_counts: list[int]) -> dict[str, Callable[[Any, list[dict[st
         }
         client.write(pl.DataFrame(columns), measurement="cpu", tag_columns=["host", "region"])
 
-    found["write(polars DataFrame)"] = frame
+    found["write(polars DataFrame)"] = (frame, None)
     return found
 
 
@@ -180,15 +205,15 @@ def main() -> None:
         points = make_points(args.points)
         print(f"{args.points:,} points (2 tags, 3 fields) to a local sink, Python {sys.version.split()[0]}\n")
         thread_counts = [int(count) for count in args.threads.split(",")]
-        for name, body in scenarios(thread_counts).items():
+        for name, (body, lines) in scenarios(points, thread_counts).items():
             if args.only not in name:
                 continue
             urllib.request.urlopen(urllib.request.Request(f"{url}/reset", data=b"", method="POST")).close()
             with InfluxClient(settings, registry=CollectorRegistry()) as client:
-                expected = client.to_line_protocol(points)
+                expected = lines or client.to_line_protocol(points)
                 gc.collect()
                 started = time.perf_counter()
-                body(client, points)
+                body(client)
                 returned = time.perf_counter() - started
                 client.flush()
                 total = time.perf_counter() - started
