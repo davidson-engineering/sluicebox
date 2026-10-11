@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from sluicebox._lineprotocol import Dialect, LineSyntaxError, UInt, parse_line
+from sluicebox._lineprotocol import Dialect, LineSyntaxError, UInt, influxdb2_runs_on, parse_line
 
 V2 = Dialect.for_version(2)
 V3 = Dialect.for_version(3)
@@ -149,3 +149,31 @@ class TestSplitLines:
             noise = rng.choice(["", '# a "comment\n', "\n"])
             text = noise + "\n".join(lines) + rng.choice(["", "\n", "\r\n"])
             assert dialect.split_lines(text) == lines, text
+
+
+#: Lines and whether InfluxDB 2 reads the line after them into them (pinned to the server in
+#: tests/integration/test_live.py, which writes each followed by another line).
+RUN_ON = [
+    ("m v=1i 1", False),
+    ('m s="closed" 1', False),
+    ('m s="two\nlines" 1', False),
+    ('m s="left open 1', True),
+    ('m a="x",b="y 1', True),  # the second value is left open
+    ('m s="a\\" 1', True),  # an escaped quote does not close it
+    ('m s="a\\\\" 1', False),  # an escaped backslash does not escape the quote
+    ('m,t="x v=1i 1', False),  # quotes in tags are literal
+    ('m a=1i,"b"=2i 1', False),  # a quote opens a value only where more "=" than "," came before
+    ('m k"ey="v 1', True),
+    ('m v=1i "x', True),  # ... also in the time
+    ('m,t=x="y v=1i 1', False),
+    ('  m,t=x="y v=1i 1', True),  # a leading space starts the fields early
+    ('\tm s="y 1', True),
+    ("m,t=a\\", True),  # a backslash escapes the line break
+    ("m v=1i 5\\", True),
+    ("m v=1i 5\\\\", False),
+]
+
+
+@pytest.mark.parametrize(("line", "runs_on"), RUN_ON)
+def test_influxdb2_runs_on(line: str, runs_on: bool) -> None:
+    assert (influxdb2_runs_on(line) is not None) is runs_on

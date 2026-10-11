@@ -6,9 +6,10 @@
   ``batch_size`` lines or ``max_batch_bytes``, or (via the flusher thread) once it is
   ``flush_interval`` old;
 * lets ``concurrency`` sender threads gzip and POST sealed batches over a keep-alive
-  connection pool, retrying transient failures with backoff and splitting batches the
-  server rejects as too large (HTTP 413); a sender takes queued batches of the same
-  database and precision along in one request while the size limits allow;
+  connection pool, retrying transient failures with backoff, splitting batches the
+  server rejects as too large (HTTP 413) and resending the rest of a batch without the
+  lines InfluxDB 2 cannot parse; a sender takes queued batches of the same database and
+  precision along in one request while the size limits allow;
 * bounds memory with ``max_pending_bytes`` (block / drop / raise when full);
 * resolves each ``write()`` call's :class:`~sluicebox.futures.WriteFuture`, attributing
   per-line partial-write errors to the exact call (and line) that produced them.
@@ -40,9 +41,10 @@ from typing import TYPE_CHECKING, Any
 from . import _fork
 from . import futures as _futures
 from ._http import Transport, error_from_response, is_html, unexpected_page_error
-from ._lineprotocol import Dialect, LineSyntaxError, parse_line
+from ._lineprotocol import Dialect, LineSyntaxError, influxdb2_runs_on, parse_line
 from ._retry import RetryPolicy
 from .exceptions import (
+    BadRequestError,
     BufferFullError,
     ClientClosedError,
     InfluxConnectionError,
@@ -59,7 +61,7 @@ from .exceptions import (
 from .log import RateLimitedLog
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Sequence
 
     from .config import InfluxSettings
     from .futures import WriteFuture
@@ -74,6 +76,10 @@ _V3_PRECISION = {"ns": "nanosecond", "us": "microsecond", "ms": "millisecond", "
 _MAX_RECORDED_FAILURES = 100
 #: A 413 for a request this small is not about its size (e.g. a proxy refusing all bodies).
 _MIN_SPLIT_BYTES = 1024
+#: Extra requests a batch may send to single out the lines InfluxDB 2 cannot parse (_isolate).
+_ISOLATION_REQUESTS = 64
+#: How InfluxDB 2 quotes each line it cannot parse in its HTTP 400 answer.
+_UNPARSEABLE = "unable to parse '"
 # Field type conflicts reported by the servers: (field, the type the server stores).
 _V3_TYPE_CONFLICT = re.compile(
     r"invalid column type for column '(?P<field>[^']+)', expected iox::column_type::field::(?P<type>\w+)"
@@ -100,7 +106,8 @@ class WriteFailure:
     error: BaseException
     #: True if the lines failed for a transient reason (network, timeouts, 429/5xx after all
     #: retries, the client closing): replaying them later should work. False if the server
-    #: refused them (invalid data, authentication, missing database): fix that first.
+    #: refused them (invalid data, authentication, missing database): fix that first. If
+    #: some lines failed each way, True: replay them, and the refused ones fail again.
     retryable: bool = False
 
     @property
@@ -202,6 +209,89 @@ class _Outcome:
     failures: list[_Failure] = field(default_factory=list)
     retries: int = 0
     bytes_sent: int = 0
+    #: Requests the batch may still send to single out lines the server cannot parse.
+    isolation_budget: int = _ISOLATION_REQUESTS
+
+
+def _fail(outcome: _Outcome, indices: Sequence[int], error: BaseException, failed: int | None = None) -> None:
+    """Record that the batch lines ``indices`` were not written (only ``failed`` of them, if given)."""
+    left = len(indices) if failed is None else failed
+    for lo, hi in _runs(indices):
+        count = min(left, hi - lo)
+        outcome.failures.append(_Failure(lo, hi, error, failed=count))
+        left -= count
+
+
+def _runs(indices: Sequence[int]) -> list[tuple[int, int]]:
+    """Ascending ``indices`` as ``(lo, hi)`` ranges of consecutive ones."""
+    if not indices:
+        return []
+    if isinstance(indices, range):
+        return [(indices[0], indices[-1] + 1)]
+    runs = []
+    lo = previous = indices[0]
+    for index in indices[1:]:
+        if index != previous + 1:
+            runs.append((lo, previous + 1))
+            lo = index
+        previous = index
+    runs.append((lo, previous + 1))
+    return runs
+
+
+def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], bool]:
+    """The lines of a request InfluxDB 2 cannot parse, ``{position in lines: reason}``, and
+    whether they account for every line its error quotes.
+
+    The message holds ``unable to parse '<line>': <reason>`` for each such line, one after the
+    other on new lines, the line without its leading whitespace. A line can contain newlines
+    (in a string field value) and ``': ``, so the reason follows the last ``': ``.
+
+    A line that runs on into the next (:func:`influxdb2_runs_on`) is one of them, whatever the
+    error says: the server quotes it together with the lines it runs into (with a reason that
+    is about all of them), or parses them as one line without complaint. Taken out, it cannot
+    join other lines when the rest is sent.
+    """
+    quotes: dict[str, str] = {}
+    complete = True
+    for entry in message[len(_UNPARSEABLE) :].split("\n" + _UNPARSEABLE):
+        text, separator, reason = entry.rpartition("': ")
+        if separator:
+            quotes[text] = reason
+        else:
+            complete = False
+    # A quote of several lines begins with the line that runs on into the others.
+    heads = {text.partition("\n")[0]: text for text in quotes if "\n" in text}
+    found: dict[int, str] = {}
+    seen: set[str] = set()
+    for position, line in enumerate(lines):
+        key = line.lstrip(" \t\0")
+        if key in quotes:
+            found[position] = quotes[key]
+            seen.add(key)
+            continue
+        runs_on = influxdb2_runs_on(line)
+        if key in heads:
+            found[position] = runs_on or quotes[heads[key]]
+            seen.add(heads[key])
+        elif runs_on is not None:
+            found[position] = runs_on
+    return found, complete and len(seen) == len(quotes)
+
+
+def _unparseable_error(source: BadRequestError, line_errors: tuple[LineError, ...]) -> PartialWriteError:
+    """The lines of a request the server could not parse, which fail alone: a partial write."""
+    details = "; ".join(f"line {e.line_number}: {e.message}" for e in line_errors[:3])
+    if len(line_errors) > 3:
+        details += f"; ... {len(line_errors) - 3} more"
+    return PartialWriteError(
+        f"unable to parse {len(line_errors)} line{'s' if len(line_errors) > 1 else ''}: {details}",
+        status=source.status,
+        code=source.code,
+        body=source.body,
+        request_id=source.request_id,
+        line_errors=line_errors,
+    )
 
 
 def _partial_error(
@@ -228,13 +318,13 @@ def _batch_failure(batch: _Batch, failures: list[_Failure], retryable: bool) -> 
     lines: list[str] = []
     for failure in failures:
         lines += batch.lines[failure.lo : failure.hi]
-    if len(failures) == 1:
-        error = failures[0].error
-    elif all(failure.line is not None and failure.hi - failure.lo == 1 for failure in failures):
+    error: BaseException
+    if all(failure.line is not None and failure.hi - failure.lo == 1 for failure in failures):
         # Rejected lines: number them within ``lines`` (they are consecutive there).
-        error = _partial_error(
-            failures, range(1, len(failures) + 1), batch.lines, "lines ", failures[0].error
-        )
+        scope = "lines " if len(failures) > 1 else "line "
+        error = _partial_error(failures, range(1, len(failures) + 1), batch.lines, scope, failures[0].error)
+    elif len(failures) == 1:
+        error = failures[0].error
     else:
         error = _futures._fresh(failures[0].error)  # the futures share the original: note only this copy
         error.add_note(f"{len(failures) - 1} other part(s) of this batch failed too (all lines are included)")
@@ -716,11 +806,14 @@ class WriteEngine:
         started = time.monotonic()
         self._stages.record("queue", started - batch.sealed)
         outcome = _Outcome()
-        self._send_range(batch, batch.lines, 0, outcome)
+        self._send(batch, batch.lines, range(len(batch.lines)), outcome)
         return outcome
 
-    def _send_range(self, batch: _Batch, lines: list[str], base: int, outcome: _Outcome) -> None:
-        """Send ``lines`` (batch lines ``base:base+len``), recording failures in ``outcome``."""
+    def _send(self, batch: _Batch, lines: list[str], indices: Sequence[int], outcome: _Outcome) -> None:
+        """Send ``lines`` (batch lines ``indices``), recording failures in ``outcome``.
+
+        ``indices`` is a range, unless lines the server could not parse were taken out.
+        """
         payload = "\n".join(lines).encode("utf-8")
         try:
             self._post(batch, payload, outcome)
@@ -731,13 +824,13 @@ class WriteEngine:
                         f"even a {len(payload)}-byte request was refused: the limit is not about size "
                         "(check the body limit of a proxy in front of the server)"
                     )
-                outcome.failures.append(_Failure(base, base + len(lines), exc))
+                _fail(outcome, indices, exc)
                 return
             self._learn_size_limit(len(payload))
             middle = len(lines) // 2
             log.debug("request of %d bytes too large; splitting %d lines in two", len(payload), len(lines))
-            self._send_range(batch, lines[:middle], base, outcome)
-            self._send_range(batch, lines[middle:], base + middle, outcome)
+            self._send(batch, lines[:middle], indices[:middle], outcome)
+            self._send(batch, lines[middle:], indices[middle:], outcome)
         except PartialWriteError as exc:
             numbers = [err.line_number for err in exc.line_errors]
             if numbers and all(1 <= number <= len(lines) for number in numbers):
@@ -745,21 +838,87 @@ class WriteEngine:
                 for err in exc.line_errors:
                     if err.line_number not in reported:
                         reported.add(err.line_number)
-                        index = base + err.line_number - 1
+                        index = indices[err.line_number - 1]
                         outcome.failures.append(_Failure(index, index + 1, exc, err))
             else:
                 # Not every rejection names a line of this request: report the whole request as
                 # failed rather than count unidentified rejected lines as written (replaying
                 # stored lines is harmless, as every point carries its timestamp).
                 rejected = max(len(exc.line_errors), exc.rejected or 0) or len(lines)
-                outcome.failures.append(
-                    _Failure(base, base + len(lines), exc, failed=min(rejected, len(lines)))
-                )
+                _fail(outcome, indices, exc, min(rejected, len(lines)))
+        except BadRequestError as exc:
+            if self._api == "v2" and exc.message.startswith(_UNPARSEABLE):
+                self._isolate(batch, lines, indices, exc, outcome)
+            else:
+                _fail(outcome, indices, exc)
         except SluiceboxError as exc:
-            outcome.failures.append(_Failure(base, base + len(lines), exc))
+            _fail(outcome, indices, exc)
+
+    def _isolate(
+        self,
+        batch: _Batch,
+        lines: list[str],
+        indices: Sequence[int],
+        error: BadRequestError,
+        outcome: _Outcome,
+    ) -> None:
+        """Write the lines of a request InfluxDB 2 refused because it cannot parse some of them.
+
+        InfluxDB 2 parses a whole request before it stores any of it: one line it cannot
+        parse fails all the others, other write() calls' lines too, and a replay of the
+        WriteFailure fails the same way. Its error quotes each such line, so those fail alone
+        (as in a partial write) and the others are sent again. If it quotes something that is
+        not one of the lines sent, the lines are halved instead, as for HTTP 413, until the
+        halves are written or down to single lines. That costs requests: a batch sends at most
+        ``_ISOLATION_REQUESTS`` more, then lines still unwritten fail with the server's error.
+        As the server stored nothing of the request, resending never writes a line twice; as
+        no line that runs on into the next is sent again, the server reads the others as sent.
+        """
+        found, complete = _unparseable_lines(error.message, lines)
+        if not found and len(lines) == 1:
+            # Alone in its request, the line is the one the server cannot parse, however quoted.
+            _, separator, reason = error.message.rpartition("': ")
+            found = {0: reason if separator else error.message}
+        if found:
+            positions = sorted(found)
+            line_errors = tuple(LineError(p + 1, found[p], lines[p]) for p in positions)
+            rejected = _unparseable_error(error, line_errors)
+            for position, line_error in zip(positions, line_errors, strict=True):
+                index = indices[position]
+                outcome.failures.append(_Failure(index, index + 1, rejected, line_error))
+            keep = [p for p in range(len(lines)) if p not in found]
+            if not keep:
+                return
+            lines = [lines[p] for p in keep]
+            indices = [indices[p] for p in keep]
+        # The rest goes in one request when the server named every line it cannot parse (or
+        # only one is left), else in halves. A sub-request's error names its own bad lines.
+        whole = len(lines) == 1 or (bool(found) and complete)
+        cost = 1 if whole else 2
+        if cost <= outcome.isolation_budget:
+            outcome.isolation_budget -= cost
+            if whole:
+                log.debug(
+                    "the server cannot parse %d lines; sending the other %d again", len(found), len(lines)
+                )
+                self._send(batch, lines, indices, outcome)
+            else:
+                middle = len(lines) // 2
+                log.debug("the server cannot parse some of %d lines; sending them in two halves", len(lines))
+                self._send(batch, lines[:middle], indices[:middle], outcome)
+                self._send(batch, lines[middle:], indices[middle:], outcome)
+            return
+        error.add_note(
+            f"{len(lines)} line(s) that may be valid were not written: lines the server cannot parse "
+            f"are singled out with at most {_ISOLATION_REQUESTS} extra requests per batch"
+        )
+        _fail(outcome, indices, error)
 
     def _post(self, batch: _Batch, payload: bytes, outcome: _Outcome) -> None:
         """POST one payload, retrying transient failures. Raises the final error."""
+        if self._stop.is_set():
+            # close() gave up on the requests in flight: send no more of them (a split batch's rest).
+            raise ClientClosedError("the client was closed before this request was sent")
         path, params = self._endpoint(batch.database, batch.precision)
         headers = {"Content-Type": "text/plain; charset=utf-8"}
         body = payload
@@ -885,13 +1044,11 @@ class WriteEngine:
                 log.exception("error while recording the metrics of a write batch")
             errors: list[BaseException | None] | None = None
             if outcome.failures:
+                # In line order (lines found unparseable are recorded before the rest of their request).
+                outcome.failures.sort(key=lambda failure: failure.lo)
                 handled = self._report(batch, outcome, failed_lines)
                 self._learn_types(batch, outcome.failures)
-                errors = []
-                start = 0
-                for count, offset in zip(batch.counts, batch.offsets, strict=True):
-                    errors.append(self._future_error(batch.lines, outcome.failures, start, count, offset))
-                    start += count
+                errors = self._future_errors(batch, outcome.failures)
                 if not handled:
                     affected = tuple(f for f, e in zip(batch.futures, errors, strict=True) if e is not None)
                     unreported = _Unreported(outcome.failures[0].error, failed_lines, affected)
@@ -976,14 +1133,34 @@ class WriteEngine:
             log.debug("wrote %d points to %r in %.1f ms", total, batch.database, elapsed * 1000)
 
     @staticmethod
+    def _future_errors(batch: _Batch, failures: list[_Failure]) -> list[BaseException | None]:
+        """The error of each future of a batch (None for success), given its failures in line order.
+
+        One pass over both: a batch can carry thousands of write() calls and rejected lines.
+        """
+        errors: list[BaseException | None] = []
+        first = 0  # the first failure that can still overlap a future's lines
+        start = 0
+        for count, offset in zip(batch.counts, batch.offsets, strict=True):
+            end = start + count
+            while first < len(failures) and failures[first].hi <= start:
+                first += 1
+            last = first
+            while last < len(failures) and failures[last].lo < end:
+                last += 1
+            relevant = failures[first:last]
+            errors.append(
+                WriteEngine._future_error(batch.lines, relevant, start, count, offset) if relevant else None
+            )
+            start = end
+        return errors
+
+    @staticmethod
     def _future_error(
-        lines: list[str], failures: list[_Failure], start: int, count: int, offset: int
-    ) -> BaseException | None:
-        """The error a future sees for its lines ``start:start+count`` of a batch."""
-        end = start + count
-        relevant = [f for f in failures if f.lo < end and f.hi > start]
-        if not relevant:
-            return None
+        lines: list[str], relevant: list[_Failure], start: int, count: int, offset: int
+    ) -> BaseException:
+        """The error a future sees for its lines ``start:start+count`` of a batch (``relevant``:
+        the failures among them)."""
         whole = [f.error for f in relevant if f.line is None]
         if whole:
             return whole[0]
@@ -1030,7 +1207,10 @@ class WriteEngine:
             )
         if self._on_error is None:
             return False
-        retryable = isinstance(first, ClientClosedError) or self._retry.is_retryable(first)
+        retryable = any(
+            isinstance(f.error, ClientClosedError) or self._retry.is_retryable(f.error)
+            for f in outcome.failures
+        )
         try:
             self._on_error(_batch_failure(batch, outcome.failures, retryable))
         except Exception:

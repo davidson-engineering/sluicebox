@@ -199,12 +199,16 @@ order, retries included.
 A batch that still fails after retries (or that the server rejects) is reported:
 
 - to the futures of the `write()` calls whose points it carried: `result()` / `await` raise
-  one error for the call, and `future.errors` lists every batch's error. For InfluxDB 3 partial
-  writes only the calls that contained a rejected line fail, and `PartialWriteError.line_errors`
-  gives each rejected line (as sent) and its number within that call;
-- to `on_error`, if given, once per failed batch, with the exact line protocol, ready to
+  one error for the call, and `future.errors` lists every batch's error. When the server
+  rejects single lines (InfluxDB 3 partial writes, and lines InfluxDB 2 cannot parse, see
+  [Server behaviour handled for you](#server-behaviour-handled-for-you)), the rest of the batch
+  is written and only the calls that contained a rejected line fail, with a `PartialWriteError`
+  whose `line_errors` give each rejected line (as sent) and its number within that call;
+- to `on_error`, if given, once per failed batch, with the exact line protocol that was not
+  written (just the rejected lines, when the server rejected single lines), ready to
   dead-letter and replay. `failure.retryable` tells transient failures (network, outage,
-  client closing) from data the server refused:
+  client closing) from data the server refused; it is true when some lines failed each way,
+  as replaying them writes those that failed transiently:
 
   ```python
   def dead_letter(failure: WriteFailure) -> None:
@@ -566,8 +570,18 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
 - InfluxDB 2 silently drops points whose measurement starts with `#` (a comment line), and
   stores but can never query measurement names containing `=`. Both are rejected client-side.
 - Names or tag values ending in a backslash, tabs in names (InfluxDB 3), NaN, int64 overflow,
-  timestamps beyond 2262 and strings over 1 MiB are rejected by the servers, often taking the
-  rest of the batch with them.
+  timestamps beyond 2262 and strings over 1 MiB are rejected by the servers. Validation rejects
+  them before they are sent.
+- InfluxDB 2 parses a whole request before storing any of it, so one line it cannot parse (raw
+  line protocol is sent unvalidated by default) fails the whole batch, other `write()` calls'
+  points included, and a replay of the dead-lettered batch fails again. Its HTTP 400 quotes each
+  such line: sluicebox takes those out and sends the rest again, so every valid line is written
+  and only the bad ones fail, each for its own `write()` call. Lines the server reads together
+  with the next line (a string value left open, or a backslash at the end) are taken out too,
+  whether it complains about them or not: two of them can turn the lines between into one
+  string value. When the quotes do not match the lines sent, the request is halved instead, as
+  for HTTP 413. This costs at most 64 extra requests per batch, and a request the server may
+  have partly stored is never resent.
 - On InfluxDB 3, `/api/v3/write_lp` (the default for version 3) keeps the valid lines of a batch
   and names the rejected ones; `/api/v2/write` rejects the whole batch.
 - Flux parameters (`params.x`) are a Cloud-only feature; sluicebox binds them so they work on OSS.

@@ -6,6 +6,7 @@ Every test runs against both servers; they are skipped when the servers are not 
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 import threading
@@ -33,13 +34,15 @@ from sluicebox import (
     Tag,
     ValidationError,
     WriteError,
+    WriteFailure,
     load_settings,
     measurement,
 )
-from sluicebox._lineprotocol import Dialect
+from sluicebox._lineprotocol import Dialect, influxdb2_runs_on
 from sluicebox.client import flux_string
 from sluicebox.types import FieldType
 from tests.servers import V2_BUCKET, V2_ORG, V2_TOKEN, V2_URL, V3_DATABASE, V3_TOKEN, V3_URL
+from tests.unit.test_lineprotocol import RUN_ON
 
 pytestmark = pytest.mark.integration
 
@@ -254,6 +257,88 @@ def test_server_rejection_is_attributed_to_the_failing_call(make_live_client: An
         assert [r["v"] for r in rows(client, unique)] == [1, 2, 3]
     stats = client.stats().write
     assert stats.points_failed == 1
+
+
+def test_a_line_the_server_cannot_parse_fails_alone(make_live_client: Any, unique: str) -> None:
+    """Raw line protocol is sent unparsed by default, so the server finds its bad lines. InfluxDB 3
+    writes the rest of the request; InfluxDB 2 stores none of it, so the client sends the rest
+    again. Either way only the bad line fails: for its write() call, and on_error."""
+    failures: list[WriteFailure] = []
+    client = make_live_client(write={"flush_interval": 60}, on_error=failures.append)
+    bad = f"{unique},t=x {ts(3)}"  # no field set
+    first = client.write([f"{unique} v=1i {ts(1)}", f"{unique} v=2i {ts(2)}"])
+    second = client.write([f"{unique} v=3i {ts(4)}", bad, f"{unique} v=4i {ts(5)}"])
+    third = client.write(f"{unique} v=5i {ts(6)}")
+    client.flush(timeout=30)  # the three calls share one request
+    assert first.result(timeout=1).points == 2
+    assert third.result(timeout=1).points == 1
+    with pytest.raises(PartialWriteError) as info:
+        second.result(timeout=1)
+    assert [(e.line_number, e.line) for e in info.value.line_errors] == [(2, bad)]
+    assert [r["v"] for r in rows(client, unique)] == [1, 2, 3, 4, 5]
+    [failure] = failures
+    assert (failure.lines, failure.retryable) == ([bad], False)
+    assert isinstance(failure.error, PartialWriteError)
+    assert [(e.line_number, e.line) for e in failure.error.line_errors] == [(1, bad)]
+    stats = client.stats().write
+    assert (stats.points_written, stats.points_failed) == (5, 1)
+
+
+def test_influxdb2_lines_it_cannot_parse_fail_alone(
+    server_version: int, make_live_client: Any, unique: str
+) -> None:
+    """InfluxDB 2 refuses a request with lines it cannot parse as a whole and quotes each of them:
+    the client takes them out and sends the rest again. Lines that leave a string open run on
+    into the next: two of them pair up and would be stored as one point, quoted by nobody, and
+    the last hides the line after it from the server until it is gone (three requests here)."""
+    if server_version != 2:
+        pytest.skip("InfluxDB 2 behaviour")
+    failures: list[WriteFailure] = []
+    client = make_live_client(write={"flush_interval": 60}, on_error=failures.append)
+    lines = [
+        f"{unique} v=1i {ts(1)}",
+        f"{unique},t=x {ts(2)}",  # no field set
+        f'{unique} v=3i,s="two\nlines" {ts(3)}',  # valid: a string may hold a newline
+        f"  {unique} v=NaN {ts(4)}",  # quoted without its leading spaces
+        f'{unique} s="open {ts(5)}',  # closed by the quote in line 7: the server parses
+        f"{unique} v=6i {ts(6)}",  # these three lines as one, without complaint
+        f'{unique} s="open {ts(7)}',
+        f"{unique} v=8i {ts(8)}",
+        f'{unique} s="left open {ts(9)}',  # the server reads on to the end of the request
+        f"{unique} v=10i {ts(10)}",
+        f"{unique} v=11i {2**63 - 1}",  # beyond the time range InfluxDB 2 stores
+        f"{unique} v=12i {ts(12)}",
+    ]
+    future = client.write(lines)
+    other = client.write(f"{unique} v=13i {ts(13)}")
+    with pytest.raises(PartialWriteError) as info:
+        future.result(timeout=30)
+    assert other.result(timeout=30).points == 1
+    rejected = (2, 4, 5, 7, 9, 11)
+    assert [(e.line_number, e.line) for e in info.value.line_errors] == [(n, lines[n - 1]) for n in rejected]
+    reasons = [e.message for e in info.value.line_errors]
+    assert reasons[:2] == ["invalid field format", "invalid number"]
+    assert reasons[2:5] == [influxdb2_runs_on(lines[4])] * 3
+    assert reasons[5].startswith("time outside range")
+    assert [r["v"] for r in rows(client, unique)] == [1, 3, 6, 8, 10, 12, 13]
+    [failure] = failures
+    assert failure.lines == [lines[n - 1] for n in rejected]
+    assert failure.retryable is False
+    stats = client.stats().write
+    assert (stats.points_written, stats.points_failed) == (7, 6)
+
+
+def test_client_reads_lines_as_influxdb2_does(server_version: int, unique: str) -> None:
+    """influxdb2_runs_on() knows which lines InfluxDB 2 reads the next line into: each is written
+    before a line without fields, which the server quotes on its own unless joined to it."""
+    if server_version != 2:
+        pytest.skip("InfluxDB 2 behaviour")
+    after = f"{unique}_after"
+    for line, runs_on in RUN_ON:
+        status, answer = _raw_write(2, line.replace("m", unique, 1) + "\n" + after)
+        assert status == 400, (line, answer)
+        joined = f"\n{after}'" in json.loads(answer)["message"]
+        assert joined is runs_on, (line, answer)
 
 
 def test_waiting_callers_share_requests(make_live_client: Any, unique: str) -> None:
@@ -499,8 +584,8 @@ def test_async_client(server_version: int, unique: str) -> None:
     assert asyncio.run(scenario()) == [{"n": 5003}]
 
 
-def _raw_write(server_version: int, body: str) -> int:
-    """POST line protocol without sluicebox (no client-side validation); returns the status."""
+def _raw_write(server_version: int, body: str) -> tuple[int, str]:
+    """POST line protocol without sluicebox (no client-side validation): the status and answer."""
     if server_version == 3:
         url = f"{V3_URL}/api/v3/write_lp?db={V3_DATABASE}&precision=nanosecond"
         auth = f"Bearer {V3_TOKEN}"
@@ -510,15 +595,15 @@ def _raw_write(server_version: int, body: str) -> int:
     request = urllib.request.Request(url, data=body.encode(), method="POST", headers={"Authorization": auth})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return int(response.status)
+            return int(response.status), response.read().decode()
     except urllib.error.HTTPError as error:
         with error:
-            return error.code
+            return error.code, error.read().decode()
 
 
 def test_server_side_raw_write_then_query(server_version: int, unique: str, make_live_client: Any) -> None:
     """Data written by another tool is readable, and the server's types can be synced."""
-    assert _raw_write(server_version, f"{unique},host=raw v=7i {T0_NS}") == 204
+    assert _raw_write(server_version, f"{unique},host=raw v=7i {T0_NS}")[0] == 204
     client = make_live_client()
     assert rows(client, unique) == [{"time": T0_NS, "host": "raw", "v": 7}]
 
@@ -529,7 +614,7 @@ def test_client_time_range_is_the_servers(server_version: int, unique: str) -> N
     dialect = Dialect.for_version(server_version)
     for stamp in (-(2**63), -(2**63) + 1, -(2**63) + 2, 2**63 - 2, 2**63 - 1):
         storable = dialect.min_time_ns <= stamp <= dialect.max_time_ns
-        status = _raw_write(server_version, f"{unique} v=1 {stamp}")
+        status, _ = _raw_write(server_version, f"{unique} v=1 {stamp}")
         assert (status == 204) == storable, (stamp, status)
 
 
