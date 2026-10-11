@@ -270,10 +270,18 @@ class TestBackpressure:
     def test_dropped_and_written_add_up(
         self, per_thread: bool, fake: FakeInflux, client_for: Callable[..., InfluxClient]
     ) -> None:
-        fake.responder = lambda _: Reply(delay=0.005)
+        # The server answers once every writer is done, so the buffer fills and writes are
+        # dropped however fast the senders would otherwise empty it.
+        written_all = threading.Event()
+        fake.responder = lambda _: Reply() if written_all.wait(30) else Reply(status=503)
         client = client_for(**self.overrides("drop"))
         futures: list[list[WriteFuture]] = [[] for _ in range(8)]
-        errors = run_threads(8, lambda t: futures[t].extend(client.write(record(t, i)) for i in range(150)))
+        try:
+            errors = run_threads(
+                8, lambda t: futures[t].extend(client.write(record(t, i)) for i in range(150))
+            )
+        finally:
+            written_all.set()
         client.flush(timeout=30)
         assert not errors
         written = {
