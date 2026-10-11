@@ -1,4 +1,6 @@
-"""Lines InfluxDB 2 cannot parse fail alone: the rest of their request is sent again and written."""
+"""Lines a server refuses a whole request for fail alone: the rest is sent again and written.
+
+InfluxDB 2 quotes the lines it cannot parse; InfluxDB 3 on /api/v2/write names only a reason."""
 
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ from sluicebox import (
     ClientClosedError,
     InfluxClient,
     PartialWriteError,
+    ValidationError,
     WriteError,
     WriteFailure,
 )
@@ -20,6 +23,7 @@ from sluicebox._engine import _ISOLATION_REQUESTS, WriteEngine, _Batch, _Failure
 from sluicebox._lineprotocol import influxdb2_runs_on
 from sluicebox.exceptions import LineError
 from sluicebox.futures import WriteFuture
+from sluicebox.types import FieldType
 
 from .fake_server import FakeInflux, Recorded, Reply
 
@@ -293,6 +297,244 @@ class TestIsolation:
         assert isinstance(future.exception(timeout=1), ClientClosedError)
 
 
+REFUSED = "write buffer error: line protocol parse failed: "
+
+
+def column_type(value: str) -> str:
+    if value[0] == '"':
+        return "field::string"
+    if value in ("t", "f", "true", "false"):
+        return "field::boolean"
+    if value[-1] in "iu":
+        return "field::integer" if value[-1] == "i" else "field::uinteger"
+    return "field::float"
+
+
+class InfluxDB3:
+    """The fake server as InfluxDB 3's /api/v2/write: a request with a line it cannot parse, or
+    that gives a column another type than its table has (stored, or from an earlier line), is
+    refused as a whole with HTTP 400, naming the reason of the first such line but not the line.
+    It parses ``m[,tag=x...] field=value[,...] [time]`` lines (simple values only), and lines
+    with an even number of quotes or a NaN value it cannot read."""
+
+    def __init__(self, fake: FakeInflux, types: dict[tuple[str, str], str] | None = None) -> None:
+        self.stored: list[str] = []
+        self.types = dict(types or {})
+        self._lock = threading.Lock()
+        fake.responder = self
+
+    def __call__(self, request: Recorded) -> Reply:
+        lines = scan_lines("\n".join(request.lines))
+        with self._lock:
+            types = dict(self.types)
+            for line in lines:
+                why = self.refusal(line, types)
+                if why is not None:
+                    return Reply(400, {"code": "invalid", "message": REFUSED + why})
+            self.types = types
+            self.stored += lines
+        return Reply()
+
+    @staticmethod
+    def refusal(line: str, types: dict[tuple[str, str], str]) -> str | None:
+        if line.count('"') % 2:
+            return "Could not parse entire line. Found trailing content: `...`"
+        if reason(line) is not None:
+            return "No fields were provided"
+        series, fields = line.split(" ")[:2]
+        table, *tags = series.split(",")
+        columns = [
+            (key, column_type(value)) for key, _, value in (f.partition("=") for f in fields.split(","))
+        ]
+        if any(value == "NaN" for value in (f.partition("=")[2] for f in fields.split(","))):
+            return "invalid float"
+        columns += [(tag.partition("=")[0], "tag") for tag in tags]
+        for column, kind in columns:
+            known = types.setdefault((table, column), kind)
+            if known != kind:
+                return (
+                    f"invalid column type for column '{column}', expected iox::column_type::{known}, "
+                    f"got iox::column_type::{kind}"
+                )
+        return None
+
+
+def v3_client(client_for: Callable[..., InfluxClient], **kwargs: object) -> InfluxClient:
+    """A client of InfluxDB 3 on /api/v2/write whose write() calls wait in one open batch."""
+    return client_for(version=3, write={"flush_interval": 60, "api": "v2"}, **kwargs)
+
+
+def floats(n: int, start: int = 0, table: str = "m") -> list[str]:
+    return [f"{table} v={i}.5 {T + i}" for i in range(start, start + n)]
+
+
+class TestInfluxDB3:
+    def test_only_the_line_it_cannot_parse_fails(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """The client cannot parse it either: the other lines go in one request, it in another."""
+        server = InfluxDB3(fake)
+        failures: list[WriteFailure] = []
+        client = v3_client(client_for, on_error=failures.append)
+        first = client.write([good(0), good(1)])
+        second = client.write([good(2), BAD, good(3)])
+        third = client.write(good(4))
+        client.flush(timeout=5)
+        assert first.result(timeout=1).points == 2
+        assert third.result(timeout=1).points == 1
+        with pytest.raises(PartialWriteError) as info:
+            second.result(timeout=1)
+        assert [(e.line_number, e.message, e.line) for e in info.value.line_errors] == [
+            (2, "No fields were provided", BAD)
+        ]
+        assert (
+            str(info.value)
+            == "HTTP 400: 1 of 3 points rejected by the server: line 2: No fields were provided"
+        )
+        assert server.stored == [good(i) for i in range(5)]
+        assert [r.lines for r in fake.write_requests[1:]] == [[good(i) for i in range(5)], [BAD]]
+        assert all(r.path == "/api/v2/write" for r in fake.write_requests)
+        [failure] = failures
+        assert (failure.lines, failure.retryable) == ([BAD], False)
+        assert isinstance(failure.error, PartialWriteError)
+        assert [(e.line_number, e.line) for e in failure.error.line_errors] == [(1, BAD)]
+        write = client.stats().write
+        assert (write.points_written, write.points_failed) == (5, 1)
+
+    def test_lines_of_the_refused_type_fail_together_and_teach_it(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """Every line giving the stored integer field a float fails, in one request: the server's
+        type did not come from them. The client learns the type, as from InfluxDB 3's own errors."""
+        server = InfluxDB3(fake, {("m", "v"): "field::integer"})
+        client = v3_client(client_for)
+        lines = [good(i) if i % 5 else f"m v={i}.5 {T + i}" for i in range(25_000)]
+        with pytest.raises(PartialWriteError) as info:
+            client.write(lines).result(timeout=10)
+        assert [e.line_number for e in info.value.line_errors] == list(range(1, 25_000, 5))
+        assert {e.message for e in info.value.line_errors} == {
+            "invalid column type for column 'v', expected iox::column_type::field::integer, "
+            "got iox::column_type::field::float"
+        }
+        assert len(server.stored) == 20_000
+        assert [len(r.lines) for r in fake.write_requests] == [25_000, 20_000, 5_000]
+        assert client.locked_types("m") == {"v": FieldType.INTEGER}
+        with pytest.raises(ValidationError, match="type conflict"):
+            client.write({"measurement": "m", "fields": {"v": 1.5}})
+
+    def test_a_type_from_earlier_in_the_request_wins(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """A new column takes the type of its first line, so the lines after it with another type
+        fail, also when the others are sent first."""
+        server = InfluxDB3(fake)
+        client = v3_client(client_for)
+        lines = [good(0), f"m v=1.5 {T + 1}", good(2), f"m v=3.5 {T + 3}"]
+        with pytest.raises(PartialWriteError) as info:
+            client.write(lines).result(timeout=5)
+        assert [e.line_number for e in info.value.line_errors] == [2, 4]
+        assert server.stored == [good(0), good(2)]
+        assert len(fake.write_requests) == 3
+
+    def test_a_reported_type_in_other_tables_is_sent_per_table(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        server = InfluxDB3(fake, {("a", "v"): "field::integer"})
+        client = v3_client(client_for)
+        lines = [*floats(3, table="b"), *floats(2, 3, table="a"), *floats(2, 5, table="c")]
+        with pytest.raises(PartialWriteError) as info:
+            client.write(lines).result(timeout=5)
+        assert [e.line_number for e in info.value.line_errors] == [4, 5]
+        assert server.stored == [*floats(3, table="b"), *floats(2, 5, table="c")]
+        assert [len(r.lines) for r in fake.write_requests] == [7, 3, 2, 2]
+
+    def test_a_tag_named_like_a_field(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        server = InfluxDB3(fake, {("m", "v"): "field::integer"})
+        client = v3_client(client_for)
+        tagged = [f"m,v=a x=1i {T + 10}", f"m,v=b x=2i {T + 11}"]
+        with pytest.raises(PartialWriteError) as info:
+            client.write([good(0), *tagged, good(1)]).result(timeout=5)
+        assert [e.line_number for e in info.value.line_errors] == [2, 3]
+        assert server.stored == [good(0), good(1)]
+        # A tag conflict proves nothing about the lines together: they are halved.
+        assert [len(r.lines) for r in fake.write_requests] == [4, 2, 2, 1, 1]
+
+    def test_lines_running_into_the_next_go_alone(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """Two strings left open pair up into one valid line, swallowing those between: sent
+        together again (here: without the line the request was refused for), they would be
+        stored that way."""
+        server = InfluxDB3(fake)
+        client = client_for(version=3, write={"api": "v2", "auto_timestamp": False})
+        first, second = f'm s="one {T + 50}', f'm s="two {T + 51}'
+        escaped = "m,t=a\\"
+        lines = [good(0), first, good(1), second, good(2), escaped, good(3), BAD]
+        with pytest.raises(PartialWriteError) as info:
+            client.write(lines).result(timeout=5)
+        assert [(e.line_number, e.line) for e in info.value.line_errors] == [
+            (2, first),
+            (4, second),
+            (6, escaped),
+            (8, BAD),
+        ]
+        assert server.stored == [good(i) for i in range(4)]
+        assert [r.lines for r in fake.write_requests[1:]] == [
+            [good(i) for i in range(4)],
+            [BAD],
+            [first],
+            [second],
+            [escaped],
+        ]
+
+    def test_lines_the_client_cannot_tell_are_found_by_halving(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        server = InfluxDB3(fake)
+        client = v3_client(client_for)
+        lines = [good(i) for i in range(16)]
+        lines[11] = f"m v=NaN {T + 11}"  # the client reads NaN, the server does not
+        with pytest.raises(PartialWriteError) as info:
+            client.write(lines).result(timeout=5)
+        assert [(e.line_number, e.message) for e in info.value.line_errors] == [(12, "invalid float")]
+        assert sorted(server.stored) == sorted(good(i) for i in range(16) if i != 11)
+        assert len(fake.write_requests) == 1 + 2 * 4  # halved from 16 lines down to 1
+
+    def test_isolation_sends_a_bounded_number_of_requests(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """The lines the client can tell are written; finding 200 refused ones would take 398
+        more requests: those left unsent fail with the server's error."""
+        server = InfluxDB3(fake)
+        failures: list[WriteFailure] = []
+        client = v3_client(client_for, on_error=failures.append)
+        lines = [good(i) if i % 6 else f"m,t={i} {T + i}" for i in range(1200)]
+        future = client.write(lines)
+        error = future.exception(timeout=10)
+        assert len(fake.write_requests) == 1 + _ISOLATION_REQUESTS
+        assert isinstance(error, BadRequestError)
+        assert any("at most 64 extra requests per batch" in note for note in error.__notes__)
+        assert sorted(server.stored) == sorted(line for i, line in enumerate(lines) if i % 6)
+        write = client.stats().write
+        assert (write.points_written, write.points_failed) == (1000, 200)
+        [failure] = failures
+        assert sorted(failure.lines) == sorted(line for i, line in enumerate(lines) if not i % 6)
+
+    def test_a_split_request_isolates_within_its_parts(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """A request refused for one reason can hide another: each part is handled anew."""
+        server = InfluxDB3(fake, {("m", "v"): "field::integer"})
+        client = v3_client(client_for)
+        lines = [good(0), f"m v=1.5 {T + 1}", BAD, good(3), f"m v=4.5 {T + 4}"]
+        with pytest.raises(PartialWriteError) as info:
+            client.write(lines).result(timeout=5)
+        assert [e.line_number for e in info.value.line_errors] == [2, 3, 5]
+        assert server.stored == [good(0), good(3)]
+
+
 class TestNoResend:
     """Only requests the server stored nothing of, for lines it could not parse, are resent."""
 
@@ -316,8 +558,22 @@ class TestNoResend:
                 },
             ),
             (3, "v3", 400, {"code": "invalid", "message": f"unable to parse '{BAD}': invalid field format"}),
+            (3, "v3", 400, {"code": "invalid", "message": REFUSED + "No fields were provided"}),
+            (
+                # InfluxDB 3 Cloud Serverless/Dedicated/Clustered: by default (Serverless:
+                # always) they store the valid lines of the request.
+                3,
+                "v2",
+                400,
+                {
+                    "code": "invalid",
+                    "line": 2,
+                    "message": "failed to parse line protocol: errors encountered on line(s): "
+                    "error parsing line 2 (1-based): No fields were provided",
+                },
+            ),
         ],
-        ids=["other-400", "influxdb1-partial-write", "v2-partial-write", "v3-api"],
+        ids=["other-400", "influxdb1-partial-write", "v2-partial-write", "v3-api", "v3-api-refused", "iox"],
     )
     def test_not_resent(
         self,
@@ -326,7 +582,7 @@ class TestNoResend:
         version: int,
         api: str | None,
         status: int,
-        body: dict[str, str],
+        body: dict[str, object],
     ) -> None:
         fake.responder = lambda _: Reply(status, body)
         client = client_for(version=version, write={"flush_interval": 60, "api": api})
