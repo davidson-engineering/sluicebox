@@ -45,7 +45,6 @@ dev = [
     "pandas-stubs>=2.2",
     "pytest>=8.3",
     "pytest-cov>=6.0",
-    "pytest-httpserver>=1.1",
     "pytest-timeout>=2.3",
     "ruff>=0.8",
 ]
