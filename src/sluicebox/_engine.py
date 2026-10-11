@@ -621,15 +621,17 @@ class WriteEngine:
                 batch = self._take()
                 self._sending.add(batch)
                 inflight = len(self._sending)
-            self._metrics.inflight(inflight)
-            outcome: _Outcome | None = None
+            # Never let a sender thread die: with all of them gone, nothing would be sent again.
             try:
+                self._metrics.inflight(inflight)
                 outcome = self._process(batch)
-            except BaseException as exc:  # never let a sender thread die
+            except BaseException as exc:
                 log.exception("unexpected error while sending a batch")
                 outcome = _Outcome(failures=[_Failure(0, len(batch.lines), exc)])
-            finally:
+            try:
                 self._finish(batch, outcome)
+            except BaseException:
+                log.exception("unexpected error while finishing a write batch")
 
     def _take(self) -> _Batch:
         """Dequeue the next batch to send (lock held, queue not empty).
@@ -728,13 +730,19 @@ class WriteEngine:
             self._send_range(batch, lines[:middle], base, outcome)
             self._send_range(batch, lines[middle:], base + middle, outcome)
         except PartialWriteError as exc:
-            numbered = [err for err in exc.line_errors if 1 <= err.line_number <= len(lines)]
-            if numbered:
-                for err in numbered:
-                    index = base + err.line_number - 1
-                    outcome.failures.append(_Failure(index, index + 1, exc, err))
+            numbers = [err.line_number for err in exc.line_errors]
+            if numbers and all(1 <= number <= len(lines) for number in numbers):
+                reported: set[int] = set()
+                for err in exc.line_errors:
+                    if err.line_number not in reported:
+                        reported.add(err.line_number)
+                        index = base + err.line_number - 1
+                        outcome.failures.append(_Failure(index, index + 1, exc, err))
             else:
-                rejected = exc.rejected if exc.rejected else len(lines)
+                # Not every rejection names a line of this request: report the whole request as
+                # failed rather than count unidentified rejected lines as written (replaying
+                # stored lines is harmless, as every point carries its timestamp).
+                rejected = max(len(exc.line_errors), exc.rejected or 0) or len(lines)
                 outcome.failures.append(
                     _Failure(base, base + len(lines), exc, failed=min(rejected, len(lines)))
                 )
@@ -842,13 +850,14 @@ class WriteEngine:
             limit,
         )
 
-    def _finish(self, batch: _Batch, outcome: _Outcome | None) -> None:
+    def _finish(self, batch: _Batch, outcome: _Outcome) -> None:
         """Report a processed batch, resolve its futures, then release it.
 
         Futures and ``on_error`` handlers run *before* the batch stops counting as
-        outstanding, so a ``flush()`` that returns has seen all of their side effects.
+        outstanding, so a ``flush()`` that returns has seen all of their side effects. A
+        failure while reporting (metrics, logging, learning server types) never keeps the
+        futures from being resolved or the batch from being released.
         """
-        assert outcome is not None
         with self._lock:
             if batch.finished:  # close() gave up on this request and reported it already
                 return
@@ -859,32 +868,15 @@ class WriteEngine:
         written = total - failed_lines
         elapsed = time.monotonic() - batch.created
         raw_bytes = batch.nbytes
-        self._stages.record("batch", elapsed)
-        if batch.serialize_time:
-            self._stages.record("serialize", batch.serialize_time)
         try:
+            try:
+                self._observe(batch, outcome, elapsed, written, failed_lines)
+            except Exception:
+                log.exception("error while recording the metrics of a write batch")
             if not outcome.failures:
-                self._metrics.batch_succeeded(batch.database, total, raw_bytes, outcome.bytes_sent, elapsed)
                 for future, _start, _count, _offset in batch.waiters:
                     future._batch_done(None)
-                if self._slow_batch is not None and elapsed > self._slow_batch:
-                    self._rate_log.log(
-                        "slow_batch",
-                        logging.WARNING,
-                        "slow write batch: %d points to %r took %.2f s from buffering to acknowledgement",
-                        total,
-                        batch.database,
-                        elapsed,
-                    )
-                else:
-                    log.debug("wrote %d points to %r in %.1f ms", total, batch.database, elapsed * 1000)
             else:
-                first = outcome.failures[0].error
-                self._metrics.batch_failed(
-                    batch.database, failed_lines, "partial" if written else "failed", first
-                )
-                if written:
-                    self._metrics.points_partially_rejected(batch.database, written, 0)
                 handled = self._report(batch, outcome, failed_lines)
                 self._learn_types(batch, outcome.failures)
                 affected = []
@@ -894,7 +886,7 @@ class WriteEngine:
                         affected.append(future)
                     future._batch_done(error)
                 if not handled:
-                    unreported = _Unreported(first, failed_lines, tuple(affected))
+                    unreported = _Unreported(outcome.failures[0].error, failed_lines, tuple(affected))
         finally:
             with self._lock:
                 self._sending.discard(batch)
@@ -921,6 +913,35 @@ class WriteEngine:
                 self._progress.notify_all()
             self._metrics.buffer(pending)
             self._metrics.inflight(inflight)
+
+    def _observe(
+        self, batch: _Batch, outcome: _Outcome, elapsed: float, written: int, failed_lines: int
+    ) -> None:
+        """Stage timings, metrics and the slow-batch log of a processed batch."""
+        self._stages.record("batch", elapsed)
+        if batch.serialize_time:
+            self._stages.record("serialize", batch.serialize_time)
+        if outcome.failures:
+            first = outcome.failures[0].error
+            self._metrics.batch_failed(
+                batch.database, failed_lines, "partial" if written else "failed", first
+            )
+            if written:
+                self._metrics.points_partially_rejected(batch.database, written, 0)
+            return
+        total = len(batch.lines)
+        self._metrics.batch_succeeded(batch.database, total, batch.nbytes, outcome.bytes_sent, elapsed)
+        if self._slow_batch is not None and elapsed > self._slow_batch:
+            self._rate_log.log(
+                "slow_batch",
+                logging.WARNING,
+                "slow write batch: %d points to %r took %.2f s from buffering to acknowledgement",
+                total,
+                batch.database,
+                elapsed,
+            )
+        else:
+            log.debug("wrote %d points to %r in %.1f ms", total, batch.database, elapsed * 1000)
 
     @staticmethod
     def _future_error(
@@ -1006,7 +1027,12 @@ class WriteEngine:
             key = (measurement, match["field"], match["type"])
             if key not in learned:
                 learned.add(key)
-                self._on_type_conflict(batch.database, *key)
+                try:
+                    self._on_type_conflict(batch.database, *key)
+                except Exception:
+                    log.exception(
+                        "could not learn the type the server stores for field %r of %r", key[1], key[0]
+                    )
 
     # ------------------------------------------------------------------------------------
     # Lifecycle

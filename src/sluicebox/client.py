@@ -441,7 +441,10 @@ class InfluxClient:
         kind = _SERVER_TYPES.get(server_type.lower())
         if kind is None:
             return
-        previous = self._serializer.relock(database, measurement, key, kind)
+        try:
+            previous = self._serializer.relock(database, measurement, key, kind)
+        except ValidationError:
+            return  # a measurement this client refuses to write (it came in as raw line protocol)
         if previous is not None:
             log.warning(
                 "the server stores field %r of %r as %s, but sluicebox had locked it as %s from an "

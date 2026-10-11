@@ -420,6 +420,77 @@ class TestServerTypes:
             client.write({"measurement": "m", "fields": {"v": "oops"}, "time": 1}).result(timeout=5)
         assert client.locked_types("m") == {"v": FieldType.FLOAT}
 
+    def test_a_conflict_on_a_measurement_the_client_rejects_keeps_the_sender_alive(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """Raw lines skip validation, so the server can report a measurement the client would
+        refuse. Learning its type used to raise on the sender thread: the future never
+        resolved and the thread died (with concurrency = 1, nothing was ever sent again)."""
+        message = (
+            "failure writing points to database: partial write: field type conflict: input field "
+            '"v" on measurement "raw" is type integer, already exists as type float dropped=1'
+        )
+        fake.responder = sequence(Reply(422, {"code": "unprocessable entity", "message": message}), Reply())
+        client = client_for(
+            version=2,
+            write={"concurrency": 1},
+            validation={"unknown_measurements": "reject"},
+            measurements={"declared": {"fields": {"v": "float"}}},
+        )
+        with pytest.raises(PartialWriteError):
+            client.write("raw v=1i 1700000000000000000").result(timeout=5)
+        later = client.write({"measurement": "declared", "fields": {"v": 1.0}, "time": 1})
+        assert later.result(timeout=5).points == 1
+
+    def test_a_failure_while_reporting_still_resolves_the_futures(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake.responder = sequence(Reply(400, v3_type_conflict(1)), Reply())
+        client = client_for(write={"concurrency": 1})
+        engine = client._engine
+
+        def broken(*args: Any) -> None:
+            raise RuntimeError("bug in the reporting code")
+
+        monkeypatch.setattr(engine._metrics, "batch_failed", broken)
+        with pytest.raises(PartialWriteError):
+            client.write({"measurement": "m", "fields": {"v": "oops"}, "time": 1}).result(timeout=5)
+        assert client.write(points(3, 10)).result(timeout=5).points == 3
+        assert client.stats().write.buffered_bytes == 0
+
+
+class TestPartialWriteAttribution:
+    def test_rejections_without_a_line_number_fail_the_whole_request(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        """A rejected line the server does not number must not be counted as written."""
+        body = v3_type_conflict(2)
+        body["data"].append({"error_message": "rejected, but which line?"})
+        fake.responder = sequence(Reply(400, body), Reply())
+        failures: list[WriteFailure] = []
+        client = client_for(on_error=failures.append)
+        future = client.write(points(3))
+        with pytest.raises(PartialWriteError):
+            future.result(timeout=5)
+        assert [len(f.lines) for f in failures] == [3]
+        assert client.stats().write.points_written == 1  # 3 lines, 2 rejections
+
+    def test_a_line_reported_twice_is_counted_once(
+        self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
+    ) -> None:
+        fake.responder = sequence(Reply(400, v3_type_conflict(2, 2)), Reply())
+        failures: list[WriteFailure] = []
+        client = client_for(on_error=failures.append)
+        with pytest.raises(PartialWriteError):
+            client.write(points(3)).result(timeout=5)
+        assert [f.lines for f in failures] == [[points_line(1)]]
+        stats = client.stats().write
+        assert (stats.points_written, stats.points_failed) == (2, 1)
+
+
+def points_line(i: int) -> str:
+    return f"m v={float(i)} {1_700_000_000_000_000_000 + i}"
+
 
 class TestMetricsForAlerting:
     def test_series_exist_before_the_first_event(
