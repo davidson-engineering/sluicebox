@@ -10,7 +10,7 @@ built to drop into an application and push large volumes of data as fast as the 
 - **Asynchronous writes**: `write()` validates and serializes on the calling thread, buffers, and
   returns at once; background threads batch, gzip and send with up to 16 requests in flight,
   retrying transient failures. Await the returned future when you need the acknowledgement.
-- **Fast**: about 1.1 M points/s serialization per thread with full validation, 3x the official
+- **Fast**: about 1.15 M points/s serialization per thread with full validation, 3x the official
   clients; polars DataFrames are serialized vectorized. End to end, 5-50x the official clients (below).
 - **Validation that prevents bad data**: field types are locked on first write and corrected from
   the server's own type errors (no more `field type conflict` batches), schemas can be declared,
@@ -497,13 +497,16 @@ reproduces them.
 | --- | --- | --- |
 | sluicebox, `write(list of dicts)` | 272 k points/s | 440 k points/s |
 | sluicebox, `write(polars DataFrame)` | 226 k points/s | 562 k points/s |
-| sluicebox, one `write()` per point | 211 k points/s | 217 k points/s |
+| sluicebox, one `write()` per point | 211 k points/s | 263 k points/s |
 | official client, batching mode | 5 k points/s | 93 k points/s |
 | official client, synchronous 5k-point writes | 5 k points/s | 84 k points/s |
 
-Serialization alone: 1.1 M points/s per thread (dicts, validation and type locking on) versus
+Serialization alone: 1.15 M points/s per thread (dicts, validation and type locking on) versus
 0.36-0.38 M points/s for the official clients' `Point` serialization
-(`benchmarks/bench_serialize.py`).
+(`benchmarks/bench_serialize.py`). Against a local sink that accepts everything instead of a
+server, the client itself writes 860 k points/s from a list of dicts and 380 k points/s with one
+`write()` per point, checking that every point arrives exactly once
+(`benchmarks/bench_client.py`).
 
 What matters most:
 
@@ -519,10 +522,11 @@ What matters most:
 - `write.no_sync = true` (InfluxDB 3 Core/Enterprise) acknowledges before the WAL is persisted:
   lower latency, weaker durability.
 - One client per process, shared by all threads, is the intended setup. Serialization of
-  records runs at about 1.1 M points/s on one core; threads do not add to that, not even on
-  free-threaded Python 3.14t (measured: allocation-heavy pure-Python code scales poorly there).
-  To use more cores for serialization, write DataFrames (vectorized in Rust) or run one client
-  per process.
+  records runs at about 1.15 M points/s on one core; threads do not add to that. On
+  free-threaded Python 3.14t they take away from it: threads writing through one client at
+  once contend for its shared state (eight writing one point per call reached half the rate
+  of one). To use more cores for serialization, write DataFrames (vectorized in Rust) or run
+  one client per process.
 
 ## Remote servers, TLS and proxies
 
@@ -579,6 +583,7 @@ uv run pytest tests/unit                        # fast, no servers needed
 uv run pytest                                   # everything (server tests skip when unavailable)
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 uv run python benchmarks/bench_write.py --server 3 --points 500000
+uv run python benchmarks/bench_client.py        # the client alone, against a local sink
 ```
 
 On first start the compose stack generates random throwaway credentials into `docker/secrets/`
