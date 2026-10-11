@@ -353,8 +353,11 @@ class Serializer:
                     line = f"{head} {','.join(out)} {timestamp}"
                 else:
                     line = f"{head} {','.join(out)} {self._timestamp(timestamp, divisor, measurement)}"
+                if line.isascii():
+                    nbytes += len(line) + 1
+                else:
+                    nbytes += _utf8_size(line, fields, measurement) + 1
                 append(line)
-                nbytes += (len(line) if line.isascii() else len(line.encode("utf-8"))) + 1
                 if journal:
                     journal.clear()
             except ValidationError as error:
@@ -1092,7 +1095,13 @@ class Serializer:
             if text.isascii():
                 nbytes = sum(map(len, candidates))
             else:
-                nbytes = sum(len(line.encode("utf-8")) for line in candidates)
+                try:
+                    nbytes = sum(len(line.encode("utf-8")) for line in candidates)
+                except UnicodeEncodeError:
+                    raise ValidationError(
+                        "line protocol must be valid Unicode, but contains an unpaired surrogate",
+                        code="invalid_encoding",
+                    ) from None
             return SerializedChunk(candidates, nbytes + len(candidates), 0)
         records = []
         for line in candidates:
@@ -1128,6 +1137,32 @@ def _with_timestamp(line: str, stamp: str) -> str:
     if tail.isdigit() or (tail[:1] == "-" and tail[1:].isdigit()):
         return line
     return body + stamp
+
+
+def _utf8_size(line: str, fields: Mapping[str, Any], measurement: str) -> int:
+    """UTF-8 size of a non-ASCII ``line``; rejects string field values UTF-8 cannot encode.
+
+    A Python str may hold unpaired surrogates (from ``surrogateescape``, JSON or Windows
+    APIs). Names and tag values were checked when first seen, so a string field is the cause.
+    """
+    try:
+        return len(line.encode("utf-8"))
+    except UnicodeEncodeError:
+        key = next((k for k, v in fields.items() if isinstance(v, str) and not _encodable(v)), None)
+        raise ValidationError(
+            "string field value must be valid Unicode, but contains an unpaired surrogate",
+            code="invalid_encoding",
+            measurement=measurement,
+            key=key,
+        ) from None
+
+
+def _encodable(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _written_keys(fields: Mapping[str, Any]) -> set[Any]:

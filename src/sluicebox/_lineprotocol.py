@@ -28,7 +28,8 @@ from typing import Any, Literal
 
 __all__ = ["Dialect", "ParsedLine", "UInt", "parse_line"]
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+#: Control characters, and unpaired surrogates (a Python str may hold them; UTF-8 cannot).
+_UNWRITABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
 STRING_ESCAPES = str.maketrans({'"': '\\"', "\\": "\\\\"})
 
 
@@ -89,9 +90,12 @@ class Dialect:
             return None if allow_empty else "must not be empty"
         if text[-1] == "\\":
             return "must not end with a backslash (InfluxDB rejects it)"
-        bad = _CONTROL.search(text)
+        bad = _UNWRITABLE.search(text)
         if bad is not None:
-            return f"must not contain control character {bad.group()!r}"
+            char = bad.group()
+            if char >= "\ud800":
+                return f"must be valid Unicode, but contains the unpaired surrogate {char!r}"
+            return f"must not contain control character {char!r}"
         return None
 
     # -- parsing ---------------------------------------------------------------------------

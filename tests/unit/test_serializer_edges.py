@@ -172,6 +172,48 @@ class TestFloats:
         ]
 
 
+UNPAIRED = "x\ud800y"
+UNENCODABLE = [
+    ({"measurement": UNPAIRED, "fields": {"v": 1.0}}, "invalid_name"),
+    ({"measurement": "m", "tags": {UNPAIRED: "a"}, "fields": {"v": 1.0}}, "invalid_name"),
+    ({"measurement": "m", "tags": {"t": UNPAIRED}, "fields": {"v": 1.0}}, "invalid_tag_value"),
+    ({"measurement": "m", "fields": {UNPAIRED: 1.0}}, "invalid_name"),
+    ({"measurement": "m", "fields": {"v": 1.0, "s": UNPAIRED}}, "invalid_encoding"),
+    (f'm s="{UNPAIRED}"', "invalid_encoding"),
+]
+
+
+class TestUnencodableText:
+    """A Python str can hold unpaired surrogates (surrogateescape, JSON, Windows APIs), which
+    UTF-8 cannot encode: such records are invalid like any other, not an encoding crash."""
+
+    @pytest.mark.parametrize(("record", "code"), UNENCODABLE)
+    def test_rejected_with_a_validation_error(self, record: Any, code: str) -> None:
+        assert rejected(make(), record).code == code
+
+    @pytest.mark.parametrize(("record", "code"), UNENCODABLE)
+    def test_dropped_in_drop_mode_and_lock_nothing(self, record: Any, code: str) -> None:
+        serializer = make(on_invalid="drop")
+        good = {"measurement": "m", "fields": {"w": 2.0}, "time": T0}
+        chunk = serializer.serialize([record, good], database="db", precision="ns")
+        assert (chunk.lines, chunk.dropped) == ([f"m w=2.0 {T0}"], 1)
+        assert chunk.nbytes == len(chunk.lines[0]) + 1
+        assert [e.code for e in chunk.rejected] == [code]
+        assert serializer.locked_types("db", "m") == {"w": FieldType.FLOAT}
+
+    def test_the_rejected_string_field_is_named(self) -> None:
+        error = rejected(make(), {"measurement": "m", "fields": {"a": "ok", "b": UNPAIRED}})
+        assert (error.key, error.measurement) == ("b", "m")
+
+    def test_valid_non_ascii_text_is_counted_in_bytes(self) -> None:
+        chunk = make().serialize(
+            [{"measurement": "m", "tags": {"t": "é"}, "fields": {"s": "😀"}, "time": T0}],
+            database="db",
+            precision="ns",
+        )
+        assert chunk.nbytes == len(chunk.lines[0].encode()) + 1
+
+
 class TestMisc:
     def test_str_enum_mixin_measurement_uses_its_value(self) -> None:
         class Measurement(str, Enum):  # noqa: UP042 - the (str, Enum) form is what is tested
