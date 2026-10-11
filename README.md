@@ -497,7 +497,7 @@ reproduces them.
 | --- | --- | --- |
 | sluicebox, `write(list of dicts)` | 272 k points/s | 440 k points/s |
 | sluicebox, `write(polars DataFrame)` | 226 k points/s | 562 k points/s |
-| sluicebox, one `write()` per point | 211 k points/s | 263 k points/s |
+| sluicebox, one `write()` per point | 211 k points/s | 260 k points/s |
 | official client, batching mode | 5 k points/s | 93 k points/s |
 | official client, synchronous 5k-point writes | 5 k points/s | 84 k points/s |
 
