@@ -478,7 +478,8 @@ def _field_expression(
                 )
             col = col.cast(pl.Float64)
         natural = source
-        if source is FieldType.INTEGER and serializer._int_as_float:
+        integer_field = plan.types.get(key) in (FieldType.INTEGER, FieldType.UINTEGER)
+        if source is FieldType.INTEGER and serializer._int_as_float and not integer_field:
             natural = FieldType.FLOAT
         expected = plan.types.get(key)
         if expected is None:
@@ -512,11 +513,11 @@ def _format_field(
     """Return (value expression whose nulls mean 'skip', formatted text expression).
 
     ``source`` is the type of the column's values, ``natural`` the type they are written as
-    by default (FLOAT for integers with ``int_as_float``) and ``expected`` the declared or
-    locked type. Integer bounds are checked on the integers themselves: converted to floats,
-    2**53 + 1 or 2**63 - 1 would turn into neighbouring values first. Error codes are the
-    row path's: a value of the wrong kind is a ``type_conflict``, a convertible value that
-    does not fit is ``out_of_range``.
+    by default (FLOAT for integers with ``int_as_float``, unless the field is an integer field)
+    and ``expected`` the declared or locked type. Integer bounds are checked on the integers
+    themselves: converted to floats, 2**53 + 1 or 2**63 - 1 would turn into neighbouring
+    values first. Error codes are the row path's: a value of the wrong kind is a
+    ``type_conflict``, a convertible value that does not fit is ``out_of_range``.
     """
     import polars as pl
 
@@ -580,8 +581,6 @@ def _format_field(
         out_of_range(value > _INT64_MAX, "a value beyond the int64 range")
         value = pl.when(value <= _INT64_MAX).then(value)
         target = expected
-    elif expected is FieldType.INTEGER and source is FieldType.INTEGER:
-        target = expected  # int_as_float, but the field is integer: the integers as they are
     else:
         conflict(value.is_not_null())
         target = natural

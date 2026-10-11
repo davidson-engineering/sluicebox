@@ -62,6 +62,7 @@ _FRAGMENT_CACHE_LIMIT = 200_000
 _TAGSET_CACHE_LIMIT = 50_000
 _TAGSET_CACHE_FILLS = 3
 _NO_COERCION: Any = object()
+_INTEGER_TYPES = (INTEGER, UINTEGER)
 
 _isfinite = math.isfinite
 
@@ -734,7 +735,7 @@ class Serializer:
                 return None
             return self._typed(plan, key, value, FLOAT, journal)
         if kind is int:
-            return self._typed(plan, key, value, FLOAT if self._int_as_float else INTEGER, journal)
+            return self._typed(plan, key, value, self._int_type(plan, key), journal)
         if kind is str:
             return self._typed(plan, key, value, STRING, journal)
         if kind is bool:
@@ -742,6 +743,13 @@ class Serializer:
         if value is None:
             return None
         return self._other_field(plan, key, value, journal)
+
+    def _int_type(self, plan: _Plan, key: str) -> FieldType:
+        """The type an int is written as: a float with ``int_as_float``, unless the field is an
+        integer field (declared, or locked from earlier values or the server's schema)."""
+        if self._int_as_float and plan.types.get(key) not in _INTEGER_TYPES:
+            return FLOAT
+        return INTEGER
 
     def _non_finite(self, plan: _Plan, key: str, value: float) -> None:
         """Skip a NaN/inf field (returns) or reject the record (raises), per validation.non_finite."""
@@ -874,7 +882,7 @@ class Serializer:
                 return None
             return self._typed(plan, key, value, FLOAT, journal)
         if isinstance(value, int):
-            return self._typed(plan, key, int(value), FLOAT if self._int_as_float else INTEGER, journal)
+            return self._typed(plan, key, int(value), self._int_type(plan, key), journal)
         if isinstance(value, str):
             return self._typed(plan, key, str(value), STRING, journal)
         raise ValidationError(

@@ -508,11 +508,13 @@ class TestEdgeValuesMatchTheRowPath:
         assert [line.split(" ")[1] for line in written] == ["v=9007199254740992.0", "v=7.0"]
         assert codes == ["type_conflict", "type_conflict"]
 
-    def test_declared_integers_stay_exact_with_int_as_float(self) -> None:
+    @pytest.mark.parametrize("coerce", [True, False])
+    def test_declared_integers_stay_exact_with_int_as_float(self, coerce: bool) -> None:
         values = [self.BIG + 1, 2**63 - 1, -(2**63)]
         written, codes = self.compare(
             pl.DataFrame({"v": values, "time": [T0] * 3}),
             int_as_float=True,
+            coerce=coerce,
             schemas={"m": {"fields": {"v": "integer"}}},
         )
         assert [line.split(" ")[1] for line in written] == [f"v={v}i" for v in values]

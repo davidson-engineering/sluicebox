@@ -214,6 +214,18 @@ class TestUnencodableText:
         assert chunk.nbytes == len(chunk.lines[0].encode()) + 1
 
 
+class TestIntAsFloat:
+    @pytest.mark.parametrize("coerce", [True, False])
+    def test_integer_fields_stay_integer(self, coerce: bool) -> None:
+        """int_as_float writes ints as floats unless the field is an integer field, declared
+        or locked (e.g. by sync_schema()): there they are integers, without coercion."""
+        declared = make(int_as_float=True, coerce=coerce, schemas={"m": {"fields": {"n": "integer"}}})
+        assert serialize(declared, {"measurement": "m", "fields": {"n": 5, "x": 7}}) == ["m n=5i,x=7.0"]
+        locked = make(int_as_float=True, coerce=coerce)
+        locked.seed_types("db", "m", {"n": FieldType.INTEGER})
+        assert serialize(locked, {"measurement": "m", "fields": {"n": np.int64(5)}}) == ["m n=5i"]
+
+
 class TestMisc:
     def test_str_enum_mixin_measurement_uses_its_value(self) -> None:
         class Measurement(str, Enum):  # noqa: UP042 - the (str, Enum) form is what is tested
