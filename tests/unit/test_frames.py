@@ -459,3 +459,138 @@ class TestUsability:
     def test_single_column_names_may_be_strings(self) -> None:
         frame = pl.DataFrame({"site": ["a"], "v": [1.0], "time": [T0]})
         assert frame_lines(make(), frame, tag_columns="site")[0] == ["m,site=a v=1.0 1704067200000000000"]
+
+
+class TestEdgeValuesMatchTheRowPath:
+    """At the limits of each type, the vectorized path accepts, rejects and formats exactly like
+    the row path. Each converted to the other's type first (2**53 + 1 to a float, a time to
+    another unit), so these values used to be written wrongly instead of rejected."""
+
+    BIG = 2**53
+
+    @staticmethod
+    def compare(
+        frame: pl.DataFrame, *, version: int = 3, lock: Any = None, **settings: Any
+    ) -> tuple[list[str], list[str]]:
+        """(lines, rejection codes) from both paths in drop mode; asserts they agree."""
+        outcomes = []
+        for vectorized in (True, False):
+            serializer = make(version, on_invalid="drop", **settings)
+            if lock is not None:
+                serializer.serialize([lock], database="db", precision="ns")
+            if vectorized:
+                written, _ = frame_lines(serializer, frame)
+            else:
+                rows = [
+                    Point("m", {}, {k: v for k, v in row.items() if k != "time"}, row.get("time"))
+                    for row in frame.iter_rows(named=True)
+                ]
+                written = serializer.serialize(rows, database="db", precision="ns").lines
+            codes = sorted(code for error, n in serializer.drops for code in [error.code] * n)  # type: ignore[attr-defined]
+            outcomes.append((written, codes))
+        assert outcomes[0] == outcomes[1]
+        return outcomes[0]
+
+    def test_int_as_float_rejects_integers_a_float_cannot_hold(self) -> None:
+        values = [self.BIG, self.BIG + 1, -self.BIG, -self.BIG - 1, 5]
+        written, codes = self.compare(pl.DataFrame({"v": values, "time": [T0] * 5}), int_as_float=True)
+        assert [line.split(" ")[1] for line in written] == [
+            "v=9007199254740992.0",
+            "v=-9007199254740992.0",
+            "v=5.0",
+        ]
+        assert codes == ["out_of_range", "out_of_range"]
+
+    def test_ints_coerced_into_a_float_field_must_be_exact(self) -> None:
+        lock = {"measurement": "m", "fields": {"v": 0.5}, "time": T0_NS}
+        values = [self.BIG, self.BIG + 1, -self.BIG - 1, 7]
+        written, codes = self.compare(pl.DataFrame({"v": values, "time": [T0] * 4}), lock=lock)
+        assert [line.split(" ")[1] for line in written] == ["v=9007199254740992.0", "v=7.0"]
+        assert codes == ["type_conflict", "type_conflict"]
+
+    def test_declared_integers_stay_exact_with_int_as_float(self) -> None:
+        values = [self.BIG + 1, 2**63 - 1, -(2**63)]
+        written, codes = self.compare(
+            pl.DataFrame({"v": values, "time": [T0] * 3}),
+            int_as_float=True,
+            schemas={"m": {"fields": {"v": "integer"}}},
+        )
+        assert [line.split(" ")[1] for line in written] == [f"v={v}i" for v in values]
+        assert codes == []
+
+    @pytest.mark.parametrize(
+        ("kind", "values", "fits"),
+        [
+            (
+                "integer",
+                [2.0**63, -(2.0**63), 9.2233720368547748e18, 1.5, -0.0],
+                [False, True, True, False, True],
+            ),
+            ("uinteger", [2.0**64, 1.844674407370955e19, -1.0, 0.0], [False, True, False, True]),
+        ],
+    )
+    def test_floats_coerced_into_integer_fields(
+        self, kind: str, values: list[float], fits: list[bool]
+    ) -> None:
+        written, codes = self.compare(
+            pl.DataFrame({"v": values, "w": [1.0] * len(values), "time": [T0] * len(values)}),
+            schemas={"m": {"fields": {"v": kind}}},
+        )
+        assert len(written) == sum(fits)
+        assert "type_conflict" in codes or "out_of_range" in codes
+
+    def test_integers_coerced_across_signedness(self) -> None:
+        unsigned = pl.DataFrame(
+            {"v": pl.Series([2**63 - 1, 2**63, 2**64 - 1], dtype=pl.UInt64), "time": [T0] * 3}
+        )
+        written, codes = self.compare(unsigned, schemas={"m": {"fields": {"v": "integer"}}})
+        assert [line.split(" ")[1] for line in written] == ["v=9223372036854775807i"]
+        assert codes == ["out_of_range", "out_of_range"]
+        signed = pl.DataFrame({"v": [-1, 0, 2**63 - 1], "time": [T0] * 3})
+        written, codes = self.compare(signed, schemas={"m": {"fields": {"v": "uinteger"}}})
+        assert [line.split(" ")[1] for line in written] == ["v=0u", "v=9223372036854775807u"]
+        assert codes == ["out_of_range"]
+
+    def test_decimals_need_coercion(self) -> None:
+        from decimal import Decimal
+
+        frame = pl.DataFrame({"v": [Decimal("1.25"), None], "w": [1.0, 2.0], "time": [T0, T0]})
+        assert self.compare(frame)[0][0].split(" ")[1] == "v=1.25,w=1.0"
+        written, codes = self.compare(frame, coerce=False)
+        assert [line.split(" ")[1] for line in written] == ["w=2.0"]
+        assert codes == ["unsupported_type"]
+
+    @pytest.mark.parametrize("unit", ["us", "ms"])
+    def test_times_outside_the_storable_range_are_rejected_not_restamped(self, unit: str) -> None:
+        years = [1500, 1678, 2262, 2263, 3000]
+        times = [datetime(year, 1, 1, tzinfo=UTC) for year in years]
+        frame = pl.DataFrame({"v": [1.0] * 5, "time": times}).with_columns(
+            pl.col("time").dt.cast_time_unit(unit)
+        )
+        written, codes = self.compare(frame)
+        assert [int(line.rsplit(" ", 1)[1]) for line in written] == [
+            (t - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1) * 1000 for t in times[1:3]
+        ]
+        assert codes == ["invalid_time"] * 3
+
+    def test_pandas_times_outside_the_storable_range_are_rejected(self) -> None:
+        far = datetime(2300, 1, 1, tzinfo=UTC)
+        frame = pd.DataFrame({"v": [1.0, 2.0], "time": pd.Series([T0, far]).astype("datetime64[us, UTC]")})
+        serializer = make(on_invalid="drop")
+        written, dropped = frame_lines(serializer, frame)
+        assert (written, dropped) == (["m v=1.0 1704067200000000000"], 1)
+
+    @pytest.mark.parametrize(
+        ("version", "stored"),
+        [(2, [-(2**63) + 2, 2**63 - 2]), (3, [-(2**63), -(2**63) + 2, 2**63 - 2, 2**63 - 1])],
+    )
+    def test_integer_times_at_the_servers_limits(self, version: int, stored: list[int]) -> None:
+        stamps = [-(2**63), -(2**63) + 2, 2**63 - 2, 2**63 - 1]
+        written, codes = self.compare(pl.DataFrame({"v": [1.0] * 4, "time": stamps}), version=version)
+        assert [int(line.rsplit(" ", 1)[1]) for line in written] == stored
+        assert codes == ["invalid_time"] * (4 - len(stored))
+
+    def test_unsigned_integer_times_beyond_int64_are_invalid_rows(self) -> None:
+        frame = pl.DataFrame({"v": [1.0, 2.0], "time": pl.Series([T0_NS, 2**64 - 1], dtype=pl.UInt64)})
+        serializer = make(on_invalid="drop")
+        assert frame_lines(serializer, frame) == ([f"m v=1.0 {T0_NS}"], 1)

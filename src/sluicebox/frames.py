@@ -204,7 +204,7 @@ def _polars_chunks(
         invalid = _Invalid()
         tag_expr = _tag_expression(frame, serializer, plan, tags, fields, invalid, journal)
         field_expr = _field_expression(frame, serializer, plan, fields, invalid, journal)
-        stamp = _time_expression(frame, serializer, precision, time_col)
+        stamp = _time_expression(frame, serializer, precision, time_col, invalid)
         invalid.add(field_expr == "", "no_fields", "record has no fields (all were null, NaN or missing)")
         for key in plan.required_fields:
             if key in fields:
@@ -461,12 +461,24 @@ def _field_expression(
     fragments = []
     for key in fields:
         dtype = frame.schema[key]
-        natural = _natural_type(dtype, key, plan.measurement)
-        if natural is None:
+        source = _natural_type(dtype, key, plan.measurement)
+        if source is None:
             continue  # an all-null column carries no fields
         info = plan.fields.get(key)
         prefix = info[0] if info is not None else serializer._new_field_key(plan, key, None)
-        if natural is FieldType.INTEGER and serializer._int_as_float:
+        col = pl.col(key)
+        if isinstance(dtype, pl.Decimal):
+            if not serializer._coerce:
+                invalid.add(
+                    col.is_not_null(),
+                    "unsupported_type",
+                    f"field {key!r} holds Decimal values, which need validation.coerce = true "
+                    "(they are written as floats)",
+                    key,
+                )
+            col = col.cast(pl.Float64)
+        natural = source
+        if source is FieldType.INTEGER and serializer._int_as_float:
             natural = FieldType.FLOAT
         expected = plan.types.get(key)
         if expected is None:
@@ -476,10 +488,7 @@ def _field_expression(
                     journal.append((plan.types, key))
             else:
                 expected = natural
-        col = pl.col(key)
-        if isinstance(dtype, pl.Decimal):
-            col = col.cast(pl.Float64)
-        value, formatted = _format_field(col, natural, expected, key, plan, serializer, invalid)
+        value, formatted = _format_field(col, source, natural, expected, key, plan, serializer, invalid)
         if info is None:
             entry = (prefix, plan.types.get(key))
             if plan.fields.setdefault(key, entry) is entry:
@@ -492,6 +501,7 @@ def _field_expression(
 
 def _format_field(
     col: pl.Expr,
+    source: FieldType,
     natural: FieldType,
     expected: FieldType,
     key: str,
@@ -499,7 +509,15 @@ def _format_field(
     serializer: Serializer,
     invalid: _Invalid,
 ) -> tuple[pl.Expr, pl.Expr]:
-    """Return (value expression whose nulls mean 'skip', formatted text expression)."""
+    """Return (value expression whose nulls mean 'skip', formatted text expression).
+
+    ``source`` is the type of the column's values, ``natural`` the type they are written as
+    by default (FLOAT for integers with ``int_as_float``) and ``expected`` the declared or
+    locked type. Integer bounds are checked on the integers themselves: converted to floats,
+    2**53 + 1 or 2**63 - 1 would turn into neighbouring values first. Error codes are the
+    row path's: a value of the wrong kind is a ``type_conflict``, a convertible value that
+    does not fit is ``out_of_range``.
+    """
     import polars as pl
 
     origin = "declared" if key in plan.declared else "locked"
@@ -513,9 +531,11 @@ def _format_field(
             key,
         )
 
-    coerce = serializer._coerce
+    def out_of_range(mask: pl.Expr, problem: str) -> None:
+        invalid.add(mask, "out_of_range", f"field {key!r} has {problem}", key)
+
     value = col
-    if natural is FieldType.FLOAT:
+    if source is FieldType.FLOAT:
         value = col.cast(pl.Float64)
         finite = value.is_finite()
         if serializer._skip_non_finite:
@@ -524,40 +544,50 @@ def _format_field(
             invalid.add(
                 value.is_not_null() & ~finite, "non_finite", f"field {key!r} has a NaN/inf value", key
             )
+    integers = source in (FieldType.INTEGER, FieldType.UINTEGER)
+    if integers:
+        inexact = value > _FLOAT_EXACT_INT
+        if source is FieldType.INTEGER:
+            inexact = inexact | (value < -_FLOAT_EXACT_INT)
     if expected is natural:
         target = natural
-    elif not coerce:
+        if natural is FieldType.FLOAT and integers:  # int_as_float
+            out_of_range(
+                inexact,
+                "an integer that cannot be written exactly as a float (validation.int_as_float); "
+                "declare the field as integer",
+            )
+    elif not serializer._coerce:
         conflict(value.is_not_null())
         target = natural
-    elif expected is FieldType.FLOAT and natural in (FieldType.INTEGER, FieldType.UINTEGER):
-        conflict(value.is_not_null() & (value.cast(pl.Float64).abs() > _FLOAT_EXACT_INT))
-        value = value.cast(pl.Float64)
+    elif expected is FieldType.FLOAT and integers:
+        conflict(inexact)  # the row path only converts ints a float holds exactly
         target = FieldType.FLOAT
-    elif expected in (FieldType.INTEGER, FieldType.UINTEGER) and natural is FieldType.FLOAT:
+    elif expected in (FieldType.INTEGER, FieldType.UINTEGER) and source is FieldType.FLOAT:
         integral = value == value.round(0)
-        upper = _INT64_MAX if expected is FieldType.INTEGER else 2**64 - 1
-        lower = -(2**63) if expected is FieldType.INTEGER else 0
-        conflict(value.is_not_null() & (~integral | (value < lower) | (value > upper)))
-        value = (
-            pl.when(integral & (value >= lower) & (value <= upper))
-            .then(value)
-            .cast(pl.Int64 if expected is FieldType.INTEGER else pl.UInt64)
-        )
+        conflict(~integral)
+        # 2.0**63 and 2.0**64 are the first floats past the int64 and uint64 ranges.
+        lower, upper = (-(2.0**63), 2.0**63) if expected is FieldType.INTEGER else (0.0, 2.0**64)
+        fits = (value >= lower) & (value < upper)
+        out_of_range(integral & ~fits, f"a value outside the {expected.value} range")
+        value = pl.when(integral & fits).then(value)
         target = expected
-    elif expected is FieldType.UINTEGER and natural is FieldType.INTEGER:
-        conflict(value.is_not_null() & (value < 0))
-        value = pl.when(value >= 0).then(value).cast(pl.UInt64)
+    elif expected is FieldType.UINTEGER and source is FieldType.INTEGER:
+        out_of_range(value < 0, "a negative value, but the field is unsigned")
+        value = pl.when(value >= 0).then(value)
         target = expected
-    elif expected is FieldType.INTEGER and natural is FieldType.UINTEGER:
-        conflict(value.is_not_null() & (value > _INT64_MAX))
-        value = pl.when(value <= _INT64_MAX).then(value).cast(pl.Int64)
+    elif expected is FieldType.INTEGER and source is FieldType.UINTEGER:
+        out_of_range(value > _INT64_MAX, "a value beyond the int64 range")
+        value = pl.when(value <= _INT64_MAX).then(value)
         target = expected
+    elif expected is FieldType.INTEGER and source is FieldType.INTEGER:
+        target = expected  # int_as_float, but the field is integer: the integers as they are
     else:
         conflict(value.is_not_null())
         target = natural
 
     if target is FieldType.FLOAT:
-        text = value.cast(pl.String)
+        text = value.cast(pl.Float64).cast(pl.String)
         # polars prints integral floats as "1.0" and keeps exponents; both parse as floats.
     elif target is FieldType.INTEGER:
         text = value.cast(pl.Int64).cast(pl.String) + pl.lit("i")
@@ -580,26 +610,27 @@ def _format_field(
     return value, text
 
 
-def _check_integer_times(
-    times: pl.Series, divisor: int, precision: str, serializer: Serializer, name: str
+def _warn_implausible_times(
+    times: pl.Series, divisor: int, lowest: int, highest: int, serializer: Serializer, name: str
 ) -> None:
-    """Reject integer times InfluxDB cannot store; warn about ones in the wrong unit."""
-    low, high = cast("int | None", times.min()), cast("int | None", times.max())
-    if low is None or high is None:
-        return
-    if high > _INT64_MAX // divisor or low < -_INT64_MAX // divisor:
-        raise ValidationError(
-            f"time column {name!r} has values outside the range InfluxDB can store with "
-            f"precision {precision!r}; is the precision right?",
-            code="invalid_time",
-            key=name,
-        )
-    serializer._int_timestamp(low, divisor, name)  # warns if it lands before 1973
+    """Warn about integer times that look like the wrong unit (out-of-range rows are invalid)."""
+    import polars as pl
+
+    times = times.cast(pl.Int64, strict=False)
+    low = cast("int | None", times.filter((times >= lowest) & (times <= highest)).min())
+    if low is not None:
+        serializer._int_timestamp(low, divisor, name)  # warns if it lands before 1973
 
 
 def _time_expression(
-    frame: pl.DataFrame, serializer: Serializer, precision: str, time_col: str | None
+    frame: pl.DataFrame, serializer: Serializer, precision: str, time_col: str | None, invalid: _Invalid
 ) -> pl.Expr | None:
+    """The timestamp text in ``precision``; rows whose time InfluxDB cannot store are invalid.
+
+    Range checks use the column's own integers: converting a time outside the int64-ns range
+    to another unit would overflow, and the null that polars makes of it would get the
+    write() time like a missing value.
+    """
     import polars as pl
 
     divisor = PRECISION_DIVISORS[precision]
@@ -608,6 +639,7 @@ def _time_expression(
         return pl.lit(str(now)) if now is not None else None
     dtype = frame.schema[time_col]
     col = pl.col(time_col)
+    dialect = serializer.dialect
     if isinstance(dtype, pl.Datetime):
         if dtype.time_zone is None and not serializer._naive_utc:
             raise ValidationError(
@@ -616,10 +648,27 @@ def _time_expression(
                 code="naive_datetime",
                 key=time_col,
             )
+        unit = dtype.time_unit
+        lowest, highest = dialect.time_range(PRECISION_DIVISORS[unit])
+        native = col.dt.epoch(time_unit=unit)  # the stored integers: never overflows
+        invalid.add(
+            (native < lowest) | (native > highest),
+            "invalid_time",
+            f"time column {time_col!r} has a value outside the range InfluxDB can store (years 1677 to 2262)",
+            time_col,
+        )
         stamp = col.dt.epoch(time_unit=precision)  # type: ignore[arg-type]
     elif dtype.is_integer():
-        stamp = col.cast(pl.Int64)
-        _check_integer_times(frame[time_col], divisor, precision, serializer, time_col)
+        lowest, highest = dialect.time_range(divisor)
+        stamp = col.cast(pl.Int64, strict=False)  # null where a uint64 exceeds int64
+        invalid.add(
+            (stamp.is_null() & col.is_not_null()) | (stamp < lowest) | (stamp > highest),
+            "invalid_time",
+            f"time column {time_col!r} has a value outside the range InfluxDB can store with "
+            f"precision {precision!r}; is the precision right?",
+            time_col,
+        )
+        _warn_implausible_times(frame[time_col], divisor, lowest, highest, serializer, time_col)
     else:
         raise ValidationError(
             f"time column {time_col!r} has dtype {dtype}; "
