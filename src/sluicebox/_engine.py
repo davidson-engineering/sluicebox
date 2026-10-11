@@ -17,9 +17,9 @@ Threads are daemons, started on first use, re-created after ``fork()``, and the 
 flushed at interpreter exit (``write.flush_on_exit``).
 
 Fork safety: a child process starts with only the thread that called ``fork()``. The engine
-locks and the futures lock are held across ``fork()``, so the child inherits consistent,
-unlocked state; the child then forgets the parent's buffers, threads and connections and
-fails the futures of data the parent is sending.
+locks (which also guard the engines' futures) are held across ``fork()``, so the child
+inherits consistent, unlocked state; the child then forgets the parent's buffers, threads and
+connections and fails the futures of data the parent is sending.
 """
 
 from __future__ import annotations
@@ -883,22 +883,19 @@ class WriteEngine:
                 self._observe(batch, outcome, elapsed, written, failed_lines)
             except Exception:
                 log.exception("error while recording the metrics of a write batch")
-            if not outcome.failures:
-                for future in batch.futures:
-                    future._batch_done(None, finished)
-            else:
+            errors: list[BaseException | None] | None = None
+            if outcome.failures:
                 handled = self._report(batch, outcome, failed_lines)
                 self._learn_types(batch, outcome.failures)
-                affected = []
+                errors = []
                 start = 0
-                for future, count, offset in zip(batch.futures, batch.counts, batch.offsets, strict=True):
-                    error = self._future_error(batch.lines, outcome.failures, start, count, offset)
+                for count, offset in zip(batch.counts, batch.offsets, strict=True):
+                    errors.append(self._future_error(batch.lines, outcome.failures, start, count, offset))
                     start += count
-                    if error is not None:
-                        affected.append(future)
-                    future._batch_done(error, finished)
                 if not handled:
-                    unreported = _Unreported(outcome.failures[0].error, failed_lines, tuple(affected))
+                    affected = tuple(f for f, e in zip(batch.futures, errors, strict=True) if e is not None)
+                    unreported = _Unreported(outcome.failures[0].error, failed_lines, affected)
+            self._resolve_futures(batch.futures, errors, finished)
         finally:
             with self._lock:
                 self._sending.discard(batch)
@@ -925,6 +922,29 @@ class WriteEngine:
                 self._progress.notify_all()
             self._metrics.buffer(pending)
             self._metrics.inflight(inflight)
+
+    def _resolve_futures(
+        self, futures: list[WriteFuture], errors: list[BaseException | None] | None, now: float
+    ) -> None:
+        """Release a completed batch's futures (``errors``: one per future, or None for none).
+
+        Their state is updated under one hold of the engine lock; waiters are woken and
+        callbacks run after it, each on its own, so one callback cannot hold up the others.
+        """
+        with self._lock:
+            if errors is None:
+                notify = [future for future in futures if future._release(None, now)]
+            else:
+                notify = [
+                    future
+                    for future, error in zip(futures, errors, strict=True)
+                    if future._release(error, now)
+                ]
+        for future in notify:
+            try:
+                future._complete()
+            except BaseException:  # e.g. SystemExit from a callback (Exceptions are caught there)
+                log.exception("a write future callback raised")
 
     def _observe(
         self, batch: _Batch, outcome: _Outcome, elapsed: float, written: int, failed_lines: int
@@ -1154,18 +1174,15 @@ class WriteEngine:
         error = ClientClosedError("buffered in the parent process before fork(); the parent sends it")
         now = time.monotonic()
         for batch in inherited:
-            for future in batch.futures:
-                future._batch_done(error, now)
+            self._resolve_futures(batch.futures, [error] * len(batch.futures), now)
 
 
-# Locks held across fork(): the engines' (in a fixed order), then the futures lock, which
-# engine code takes while holding an engine lock.
+# The engines' locks (which also guard their futures) are held across fork(), in a fixed order.
 _held_across_fork: list[threading.Lock] = []
 
 
 def _before_fork() -> None:
     _held_across_fork[:] = [engine._lock for engine in list(_ENGINES)]
-    _held_across_fork.append(_futures._LOCK)
     for lock in _held_across_fork:
         lock.acquire()
 
@@ -1177,8 +1194,7 @@ def _after_fork_in_parent() -> None:
 
 
 def _release_in_child() -> None:
-    _futures._LOCK.release()  # the engine locks are replaced by _after_fork
-    _held_across_fork.clear()
+    _held_across_fork.clear()  # the engine locks are replaced by _after_fork
 
 
 def _reset_engines_in_child() -> None:
