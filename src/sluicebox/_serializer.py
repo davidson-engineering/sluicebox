@@ -19,8 +19,8 @@ import math
 import operator
 import re
 import time
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -74,7 +74,7 @@ class SerializedChunk:
     nbytes: int
     dropped: int
     #: Why records were dropped (``on_invalid = "drop"``), in input order.
-    rejected: list[ValidationError] = field(default_factory=list)
+    rejected: Sequence[ValidationError] = ()
 
 
 class _Plan:
@@ -107,10 +107,10 @@ class _Plan:
         self.fields: dict[str, tuple[str, FieldType | None]] = {}
         #: Tag keys seen (tracked only where tag/field name overlap is forbidden).
         self.tag_keys: set[str] = set()
-        #: tuple(final tags.items()) -> serialized "measurement,k=v,..." head (None = disabled).
-        self.tagsets: dict[tuple[tuple[str, Any], ...], str] | None = {}
+        #: (*final tag keys, *their values) -> serialized "measurement,k=v,..." head (None = disabled).
+        self.tagsets: dict[tuple[Any, ...], str] | None = {}
         #: Same, keyed by the point's own tags when only (constant) static tags are injected.
-        self.static_tagsets: dict[tuple[tuple[str, Any], ...], str] | None = {}
+        self.static_tagsets: dict[tuple[Any, ...], str] | None = {}
         self.tagset_fills = 0
         self.rules = rules
         self.allowed_tags = schema.tags if schema else None
@@ -189,7 +189,7 @@ class Serializer:
         append = lines.append
         nbytes = 0
         dropped = 0
-        rejected: list[ValidationError] = []
+        rejected: list[ValidationError] | None = None  # a list once a record is dropped
         index = start_index - 1
         # Untimed points of one call share the write() time: detect ones that would overwrite
         # each other (same series and field). Tracking starts lazily at the second such point.
@@ -208,7 +208,8 @@ class Serializer:
         injector = self.injector
         enrich = bool(injector.enrichers)
         static = bool(injector.static)
-        context_get = _CONTEXT_TAGS.get
+        # Context tags cannot change during the call (an enricher's own tag_context ends with it).
+        context = _CONTEXT_TAGS.get()
         int_as_float = self._int_as_float
         skip_non_finite = self._skip_non_finite
         max_chars = self._max_string_chars_fast
@@ -240,7 +241,8 @@ class Serializer:
                         append(line)
                     nbytes += raw.nbytes
                     dropped += raw.dropped
-                    rejected += raw.rejected
+                    if raw.rejected:
+                        rejected = [*(rejected or ()), *raw.rejected]
                     continue
                 else:
                     measurement, tags, fields, timestamp = self._unpack_other(record, database)
@@ -256,7 +258,6 @@ class Serializer:
                     tags = self._as_mapping(tags, "tags", measurement)
 
                 # -- tags: injection, then the cached serialized tag set ------------------------------
-                context = context_get()
                 if plan.rules or enrich or context is not None:
                     # Content-dependent injection: cache by the final tags.
                     tags = injector.apply(measurement, tags, fields, plan.rules, context)
@@ -271,7 +272,8 @@ class Serializer:
                     injected = False
                 if tags or injected:
                     head = None
-                    signature: tuple[tuple[str, Any], ...] | None = tuple(tags.items()) if tags else ()
+                    # Keys, then values: one tuple, and distinct for distinct tag sets.
+                    signature: tuple[Any, ...] | None = (*tags, *tags.values()) if tags else ()
                     if cache is not None:
                         try:
                             head = cache.get(signature)  # type: ignore[arg-type]
@@ -368,6 +370,8 @@ class Serializer:
                 if self._raise:
                     raise
                 dropped += 1
+                if rejected is None:
+                    rejected = []
                 rejected.append(error)
                 if self.on_drop is not None:
                     self.on_drop(error, 1)
@@ -385,6 +389,8 @@ class Serializer:
                 if self._raise:
                     raise invalid from None
                 dropped += 1
+                if rejected is None:
+                    rejected = []
                 rejected.append(invalid)
                 if self.on_drop is not None:
                     self.on_drop(invalid, 1)
@@ -397,7 +403,7 @@ class Serializer:
                 "Give such points timestamps (or distinguishing tags)",
                 overwritten,
             )
-        return SerializedChunk(lines, nbytes, dropped, rejected)
+        return SerializedChunk(lines, nbytes, dropped, rejected or ())
 
     def seed_types(self, database: str, measurement: str, types: Mapping[str, FieldType]) -> None:
         """Lock field types learned elsewhere (e.g. from the server's schema)."""
@@ -474,8 +480,8 @@ class Serializer:
         self,
         plan: _Plan,
         tags: Mapping[str, Any],
-        signature: tuple[tuple[str, Any], ...] | None,
-        cache: dict[tuple[tuple[str, Any], ...], str] | None,
+        signature: tuple[Any, ...] | None,
+        cache: dict[tuple[Any, ...], str] | None,
         static_cache: bool,
         journal: list[tuple[Any, Any]] | None = None,
     ) -> str:
