@@ -390,6 +390,7 @@ class TestLifecycle:
     def test_forked_child_writes_its_own_data_only(self, fake: FakeInflux, client_for: Any) -> None:
         """A real fork: the child gets fresh threads/connections and never re-sends the parent's buffer."""
         client = client_for(write={"flush_interval": 60})
+        client.write(points(1, start=20)).result(timeout=5)  # leaves a connection in the pool
         parent_future = client.write(points(2))  # buffered in the parent, not yet sent
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)  # "process is multi-threaded" (expected here)
@@ -403,9 +404,11 @@ class TestLifecycle:
                 os._exit(code)
         _, status = os.waitpid(pid, 0)
         assert os.waitstatus_to_exitcode(status) == 0
-        assert fake.lines == ["m v=10.0 10"]  # only the child's point so far
+        assert fake.lines == ["m v=20.0 20", "m v=10.0 10"]  # only the child's point since
         assert parent_future.result(timeout=5).points == 2
-        assert sorted(fake.lines) == ["m v=0.0 0", "m v=1.0 1", "m v=10.0 10"]
+        assert sorted(fake.lines) == ["m v=0.0 0", "m v=1.0 1", "m v=10.0 10", "m v=20.0 20"]
+        # The child connected anew instead of sharing the inherited socket, which outlived it.
+        assert [r.connection for r in fake.write_requests] == [1, 2, 1]
 
     def test_stats_and_futures(self, fake: FakeInflux, client_for: Any) -> None:
         client = client_for()
@@ -434,6 +437,28 @@ class TestProxy:
         assert request.path == "/api/v3/write_lp"
         assert request.headers["Proxy-Authorization"] == "Basic dXNlcjpwQHNz"  # user:p@ss
         assert request.headers["Host"] == "influx.example:8181"
+
+
+class TestConnections:
+    def test_sequential_writes_reuse_one_connection(self, fake: FakeInflux, client_for: Any) -> None:
+        client = client_for()
+        for i in range(5):
+            client.write(points(1, start=i)).result(timeout=5)
+        assert [r.connection for r in fake.requests] == [1] * 5
+
+    def test_a_pooled_connection_the_server_closed_is_retried_at_once_on_a_new_one(
+        self, fake: FakeInflux, client_for: Any, caplog: Any
+    ) -> None:
+        fake.responder = sequence(Reply(), Reply(disconnect=True), Reply())
+        client = client_for(write={"retry": {"initial_delay": 5, "max_delay": 5}})  # a backoff would show
+        client.write(points(1)).result(timeout=5)  # leaves its connection in the pool
+        started = time.monotonic()
+        assert client.write(points(1, start=1)).result(timeout=5).points == 1
+        assert time.monotonic() - started < 2
+        assert [r.connection for r in fake.write_requests] == [1, 1, 2]
+        assert fake.write_requests[2].lines == fake.write_requests[1].lines == ["m v=1.0 1"]
+        assert client.stats().write.retries == 1
+        assert any("retrying now on a new connection" in r.getMessage() for r in caplog.records)
 
 
 class TestConcurrency:
@@ -521,3 +546,4 @@ class TestConcurrency:
         assert not errors
         assert outcomes == [[1] * per_thread for _ in range(threads_count)]
         assert len(fake.lines) == threads_count * per_thread
+        assert len({r.connection for r in fake.requests}) <= 4  # kept alive: one per sender at most
