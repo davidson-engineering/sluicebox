@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import threading
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -13,11 +14,13 @@ import pytest
 from pydantic import BaseModel
 
 from sluicebox import Point, Tag, Timestamp, UInt, ValidationError, measurement
-from sluicebox._lineprotocol import Dialect
-from sluicebox._serializer import Serializer
+from sluicebox._lineprotocol import Dialect, line_end_problem
+from sluicebox._serializer import Serializer, _with_timestamp
 from sluicebox.config import MeasurementSchema, TagRule, TagsConfig, ValidationConfig
 from sluicebox.tags import TagInjector, tag_context
 from sluicebox.types import FieldType
+
+from .test_lineprotocol import ALPHABET, RUN_ON
 
 T0 = 1_700_000_000_000_000_000
 
@@ -217,6 +220,92 @@ class TestTimestamps:
 
     def test_raw_lines_are_not_stamped_without_auto_timestamp(self) -> None:
         assert lines(make(), "m x=1\nm x=2 3") == ["m x=1", "m x=2 3"]
+
+
+class TestLinesThatRunOn:
+    """Lines of many write() calls share a request: a raw line that would take the next one in
+    (another call's, lost without an error) is invalid, also when passed through unvalidated."""
+
+    @pytest.mark.parametrize("version", [2, 3])
+    @pytest.mark.parametrize(("line", "runs_on"), RUN_ON)
+    def test_rejected_at_write(self, version: int, line: str, runs_on: bool) -> None:
+        for raw_lines in ("passthrough", "validate"):
+            s = make(version, raw_lines=raw_lines)
+            if runs_on:
+                error = error_of(s, line)
+                assert error.code == "invalid_line"
+                if raw_lines == "passthrough":
+                    assert error.message == f"invalid line protocol: {line_end_problem(line)}: {line!r}"
+            elif raw_lines == "passthrough":
+                assert lines(s, line) == [line]
+
+    def test_dropped_alone_with_on_invalid_drop(self) -> None:
+        s = make(on_invalid="drop")
+        cut, escaped = 'm s="cut 17000', "m,t=a\\"
+        chunk = s.serialize(
+            ["m v=1i 1", cut, "m v=2i 2", escaped, b"m v=3i 3"], database="db", precision="ns"
+        )
+        assert chunk.lines == ["m v=1i 1", "m v=2i 2", "m v=3i 3"]
+        assert chunk.dropped == 2
+        assert [(e.code, e.index) for e in chunk.rejected] == [("invalid_line", 1), ("invalid_line", 3)]
+        assert [(e.code, n) for e, n in s.drops] == [("invalid_line", 1)] * 2  # type: ignore[attr-defined]
+
+    def test_found_in_text_and_bytes(self) -> None:
+        text = 'm v=1i 1\nm s="cut 17000\nm v=2i 2'
+        for data in (text, text.encode()):
+            error = error_of(make(), data)
+            assert error.code == "invalid_line"
+            assert "'m s=\"cut 17000'" in error.message
+
+    def test_a_string_closed_by_a_later_line(self) -> None:
+        """Within one text, a later line can close a string left open: read as the server
+        does, that is one line, holding the lines between, which no longer parses."""
+        text = 'm v=1i 1\nm s="cut 5\nm v=2i 2\nm s="cut 7\nm v=3i 3'
+        assert make().dialect.split_lines(text)[1] == 'm s="cut 5\nm v=2i 2\nm s="cut 7'
+        error = error_of(make(), text)
+        assert error.code == "invalid_line"
+        assert "a string value spans a line break, but the line it makes is invalid" in error.message
+
+    @pytest.mark.parametrize("version", [2, 3])
+    def test_lines_the_client_writes_are_read_as_written(self, version: int) -> None:
+        """InfluxDB 2 reads the backslash in "a\\ b" (escaped as "a\\\\ b") as escaping the
+        next backslash: with quotes later in the line, the line ends elsewhere, so it is
+        rejected. InfluxDB 3 escapes every backslash, so its lines always end where written."""
+        rng = random.Random(version)
+        s = make(version, on_invalid="drop")
+        rejected = 0
+        for _ in range(3_000):
+            text = "".join(rng.choice([*ALPHABET, "\n", "\\"]) for _ in range(rng.randint(0, 8)))
+            tag = random_name(rng)
+            record = {
+                "measurement": random_name(rng),
+                "tags": {tag: random_name(rng)},
+                "fields": {"s": text, "v": 1},
+            }
+            chunk = s.serialize([record], database="db", precision="ns")
+            for line in chunk.lines:
+                assert line_end_problem(line) is None, line
+            rejected += chunk.dropped
+            assert {e.code for e in chunk.rejected} <= {"invalid_name"}
+        assert (rejected > 0) is (version == 2)
+        error = error_of(make(2), {"measurement": "m", "tags": {"a\\ b": '"c'}, "fields": {"v": 1}})
+        assert error.code == "invalid_name"
+        assert error.message.startswith(
+            "InfluxDB 2 would not read the line as written (a string value is left open"
+        )
+
+    def test_stamping_keeps_an_escaped_trailing_space(self) -> None:
+        assert _with_timestamp("m v=1i\\ ", " 5") == "m v=1i\\  5"
+        assert _with_timestamp("m v=1i\\\\ ", " 5") == "m v=1i\\\\ 5"  # the backslash is escaped
+        assert _with_timestamp("m v=1i \t", " 5") == "m v=1i 5"
+
+
+def random_name(rng: random.Random) -> str:
+    """A measurement, tag key or tag value both servers can store."""
+    while True:
+        text = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 10)))
+        if text[-1] != "\\" and text[0] != "#" and "=" not in text:
+            return text
 
 
 class TestByteCounts:

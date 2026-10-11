@@ -18,8 +18,8 @@ InfluxDB 2 and 3 disagree on backslashes (verified against InfluxDB 2.9 and 3.12
 
 String field values escape ``"`` and ``\\`` identically on both, and may contain newlines
 (both servers store them): lines are split only on newlines outside string field values.
-InfluxDB 2 reads a line that leaves a string value open, or ends in a backslash, together with
-the next line (see :func:`influxdb2_runs_on`), and may store the two as one point.
+Both split a request into lines the same way, and read a line that leaves a string value open,
+or ends in a backslash, together with the next line (see :func:`line_end_problem`).
 """
 
 from __future__ import annotations
@@ -28,16 +28,17 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-__all__ = ["Dialect", "ParsedLine", "UInt", "influxdb2_runs_on", "parse_line"]
+__all__ = ["Dialect", "ParsedLine", "UInt", "line_end_problem", "parse_line"]
 
 #: Control characters, and unpaired surrogates (a Python str may hold them; UTF-8 cannot).
 _UNWRITABLE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
 STRING_ESCAPES = str.maketrans({'"': '\\"', "\\": "\\\\"})
-# What InfluxDB 2's line splitting looks at, outside and inside a string field value.
-_SPLIT_SPECIALS = re.compile(r'[\\ =,"]')
+# What the servers' line splitting looks at, outside and inside a string field value.
+_SPLIT_SPECIALS = re.compile(r'[\\ =,"\n]')
 _STRING_SPECIALS = re.compile(r'[\\"]')
-_LEFT_OPEN = "a string value is left open, so InfluxDB 2 reads the next line into it"
-_ESCAPED_END = "a backslash at the end escapes the line break, so InfluxDB 2 reads the next line into it"
+_LEFT_OPEN = "a string value is left open, so the server reads the next line into it"
+_ESCAPED_END = "a backslash at the end escapes the line break, so the server reads the next line into it"
+_ENDS_EARLY = "the server ends the line at a line break that is not inside a string value"
 
 
 class UInt(int):
@@ -317,17 +318,38 @@ def parse_line(dialect: Dialect, line: str) -> ParsedLine:
     return ParsedLine(measurement, tags, fields, timestamp)
 
 
-def influxdb2_runs_on(line: str) -> str | None:
-    """Why InfluxDB 2 would read the line after ``line`` in a request into it, or None.
+def line_end_problem(line: str) -> str | None:
+    """Why the server would not read ``line``, sent before another line, as one line, or None.
 
-    It ends a line at a newline unless the newline is inside a string field value or escaped:
-    a backslash escapes whatever follows it (models.scanLine). A string value starts at a
-    quote after the first space, when more ``=`` than ``,`` have come since. A line leaving one
-    open, or ending in a backslash, runs on into the next line, so the server parses (and may
-    store) the two as one: a later line can close the value and swallow the lines between.
+    A line ends at a newline unless the newline is inside a string field value or escaped: a
+    backslash escapes whatever follows it. A string value starts at a quote after the first
+    space, when more ``=`` than ``,`` have come since. A line leaving one open, or ending in a
+    backslash, runs on into the next line, so the server parses (and may store) the two as one:
+    a later line can close the value and swallow the lines between. This is InfluxDB 2's
+    models.scanLine, which InfluxDB 3 ports (both verified: 2.9, 3.12).
     """
-    if '"' not in line and "\\" not in line:
-        return None
+    quote = line.find('"')
+    if "\\" not in line:
+        if quote < 0:
+            return _ENDS_EARLY if "\n" in line else None
+        start = line.find(" ")
+        if 0 <= start < quote and "\n" not in line:
+            # The common case, with str methods: the '=' and ',' between quotes outside values.
+            balance = 0
+            while quote >= 0:
+                balance += line.count("=", start, quote) - line.count(",", start, quote)
+                if balance > 0:  # the quote opens a value: skip to the quote closing it
+                    quote = line.find('"', quote + 1)
+                    if quote < 0:
+                        return _LEFT_OPEN
+                start = quote + 1
+                quote = line.find('"', start)
+            return None
+    return _scan_line_end(line)
+
+
+def _scan_line_end(line: str) -> str | None:
+    """:func:`line_end_problem` for any line, a character the server looks at at a time."""
     last = len(line) - 1
     i = 0
     fields = quoted = False
@@ -343,6 +365,8 @@ def influxdb2_runs_on(line: str) -> str | None:
                 return _ESCAPED_END
             i += 2
             continue
+        if char == "\n":
+            return _ENDS_EARLY  # only found outside a string value
         if char == " ":
             fields = True
         elif fields and char == '"':

@@ -17,11 +17,12 @@ from sluicebox import (
     WriteFailure,
 )
 from sluicebox._engine import _ISOLATION_REQUESTS, WriteEngine, _Batch, _Failure, _runs, _unparseable_lines
-from sluicebox._lineprotocol import influxdb2_runs_on
+from sluicebox._lineprotocol import line_end_problem
 from sluicebox.exceptions import LineError
 from sluicebox.futures import WriteFuture
 
 from .fake_server import FakeInflux, Recorded, Reply
+from .test_lineprotocol import scan_lines
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 T = 1_700_000_000_000_000_000
 BAD = f"m,t=x {T + 99}"  # no field set
 CUT = f'm s="cut short {T + 98}'  # a string value left open
-LEFT_OPEN = influxdb2_runs_on(CUT)
+LEFT_OPEN = line_end_problem(CUT)
 
 
 def good(i: int) -> str:
@@ -41,38 +42,6 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
     while not predicate():
         assert time.monotonic() < deadline, "timed out"
         time.sleep(0.005)
-
-
-def scan_lines(text: str) -> list[str]:
-    """The lines of a request body as InfluxDB 2 reads them (its models.scanLine).
-
-    A newline inside a string field value does not end the line; a value left open runs on to
-    the next quote, or the end of the request. Lines lose their leading whitespace.
-    """
-    lines = []
-    i, n = 0, len(text)
-    while i < n:
-        start, quoted, fields, equals, commas = i, False, False, 0, 0
-        while i < n:
-            char = text[i]
-            if char == "\\" and i + 2 < n:
-                i += 2
-                continue
-            if char == " ":
-                fields = True
-            if fields and not quoted and char in "=,":
-                equals += char == "="
-                commas += char == ","
-            elif fields and char == '"' and equals > commas:
-                quoted = not quoted
-            elif char == "\n" and not quoted:
-                break
-            i += 1
-        line = text[start:i].lstrip(" \t\0")
-        if line and line[0] != "#":
-            lines.append(line)
-        i += 1
-    return lines
 
 
 def reason(line: str) -> str | None:
@@ -103,12 +72,20 @@ class InfluxDB2:
         return Reply()
 
 
+@pytest.fixture
+def unchecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let lines that run on into the next past write(), which rejects them: the engine takes
+    them out of a request whatever reached it."""
+    monkeypatch.setattr("sluicebox._serializer._check_line_ends", lambda *args: None)
+
+
 def v2_client(client_for: Callable[..., InfluxClient], **kwargs: object) -> InfluxClient:
     """A client whose write() calls wait in one open batch until flushed."""
     return client_for(version=2, write={"flush_interval": 60}, **kwargs)
 
 
 class TestIsolation:
+    @pytest.mark.usefixtures("unchecked")
     def test_only_the_unparseable_lines_fail(
         self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
     ) -> None:
@@ -153,6 +130,7 @@ class TestIsolation:
         assert (write.points_written, write.points_failed) == (6, 3)
         assert (write.batches_written, write.batches_failed, write.buffered_bytes) == (0, 1, 0)
 
+    @pytest.mark.usefixtures("unchecked")
     def test_a_string_left_open_fails_alone(
         self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
     ) -> None:
@@ -166,6 +144,7 @@ class TestIsolation:
         assert server.stored == [good(0), good(1), good(2)]
         assert len(fake.write_requests) == 2
 
+    @pytest.mark.usefixtures("unchecked")
     def test_lines_running_into_the_next_are_never_sent_again(
         self, fake: FakeInflux, client_for: Callable[..., InfluxClient]
     ) -> None:
@@ -189,7 +168,7 @@ class TestIsolation:
         assert [e.message for e in info.value.line_errors] == [
             LEFT_OPEN,
             LEFT_OPEN,
-            influxdb2_runs_on(escaped),
+            line_end_problem(escaped),
             "invalid field format",
         ]
         assert server.stored == [good(i) for i in range(6)]
@@ -396,7 +375,7 @@ class TestQuotedLines:
         found, complete = _unparseable_lines(
             "unable to parse 'm s=\"cut 2\nm v=3 3\nm v=4 4': unbalanced quotes", lines
         )
-        assert (found, complete) == ({1: influxdb2_runs_on('m s="cut 2')}, True)
+        assert (found, complete) == ({1: line_end_problem('m s="cut 2')}, True)
 
     def test_lines_running_into_the_next_are_found_unquoted(self) -> None:
         """Two strings left open pair up: the server parses them as one line, quoting neither."""

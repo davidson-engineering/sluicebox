@@ -38,7 +38,7 @@ from sluicebox import (
     load_settings,
     measurement,
 )
-from sluicebox._lineprotocol import Dialect, influxdb2_runs_on
+from sluicebox._lineprotocol import Dialect, line_end_problem
 from sluicebox.client import flux_string
 from sluicebox.types import FieldType
 from tests.servers import V2_BUCKET, V2_ORG, V2_TOKEN, V2_URL, V3_DATABASE, V3_TOKEN, V3_URL
@@ -285,14 +285,16 @@ def test_a_line_the_server_cannot_parse_fails_alone(make_live_client: Any, uniqu
 
 
 def test_influxdb2_lines_it_cannot_parse_fail_alone(
-    server_version: int, make_live_client: Any, unique: str
+    server_version: int, make_live_client: Any, unique: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """InfluxDB 2 refuses a request with lines it cannot parse as a whole and quotes each of them:
     the client takes them out and sends the rest again. Lines that leave a string open run on
     into the next: two of them pair up and would be stored as one point, quoted by nobody, and
-    the last hides the line after it from the server until it is gone (three requests here)."""
+    the last hides the line after it from the server until it is gone (three requests here).
+    write() rejects such lines; past that check, the engine still takes them out."""
     if server_version != 2:
         pytest.skip("InfluxDB 2 behaviour")
+    monkeypatch.setattr("sluicebox._serializer._check_line_ends", lambda *args: None)
     failures: list[WriteFailure] = []
     client = make_live_client(write={"flush_interval": 60}, on_error=failures.append)
     lines = [
@@ -318,7 +320,7 @@ def test_influxdb2_lines_it_cannot_parse_fail_alone(
     assert [(e.line_number, e.line) for e in info.value.line_errors] == [(n, lines[n - 1]) for n in rejected]
     reasons = [e.message for e in info.value.line_errors]
     assert reasons[:2] == ["invalid field format", "invalid number"]
-    assert reasons[2:5] == [influxdb2_runs_on(lines[4])] * 3
+    assert reasons[2:5] == [line_end_problem(lines[4])] * 3
     assert reasons[5].startswith("time outside range")
     assert [r["v"] for r in rows(client, unique)] == [1, 3, 6, 8, 10, 12, 13]
     [failure] = failures
@@ -328,17 +330,63 @@ def test_influxdb2_lines_it_cannot_parse_fail_alone(
     assert (stats.points_written, stats.points_failed) == (7, 6)
 
 
-def test_client_reads_lines_as_influxdb2_does(server_version: int, unique: str) -> None:
-    """influxdb2_runs_on() knows which lines InfluxDB 2 reads the next line into: each is written
-    before a line without fields, which the server quotes on its own unless joined to it."""
-    if server_version != 2:
-        pytest.skip("InfluxDB 2 behaviour")
+def test_client_reads_lines_as_the_server_does(server_version: int, unique: str) -> None:
+    """line_end_problem() knows which lines the server reads the next line into: each is written
+    before a line without fields, which the server reports on its own unless joined to it."""
     after = f"{unique}_after"
     for line, runs_on in RUN_ON:
-        status, answer = _raw_write(2, line.replace("m", unique, 1) + "\n" + after)
+        status, answer = _raw_write(server_version, line.replace("m", unique, 1) + "\n" + after)
         assert status == 400, (line, answer)
-        joined = f"\n{after}'" in json.loads(answer)["message"]
+        if server_version == 3:  # it numbers the lines as it splits them
+            joined = all(error["line_number"] != 2 for error in json.loads(answer)["data"])
+        else:  # it quotes them
+            joined = f"\n{after}'" in json.loads(answer)["message"]
         assert joined is runs_on, (line, answer)
+
+
+def test_lines_that_run_on_are_rejected_at_write(make_live_client: Any, unique: str) -> None:
+    """Raw lines of many write() calls share a request. A line leaving a string value open, or
+    ending in a backslash, would take the next call's line in: InfluxDB 3 neither stores nor
+    reports it, InfluxDB 2 stores two such lines, and the lines between, as one point. write()
+    rejects them, so every other line is stored and counted, on both servers."""
+    client = make_live_client(write={"flush_interval": 60}, validation={"on_invalid": "drop"})
+    good = [f"{unique} v={i}i {ts(i)}" for i in range(1, 6)]
+    bad = [f'{unique} s="cut {ts(10)}', f'{unique} s="cut {ts(11)}', f"{unique},t=a\\"]
+    calls = [good[0], bad[0], good[1], bad[1], good[2], bad[2], good[3], f"{good[4]}\n{bad[0]}"]
+    futures = [client.write(call) for call in calls]
+    client.flush(timeout=30)
+    results = [future.result(timeout=1) for future in futures]
+    assert [(r.points, r.dropped) for r in results] == [(1, 0), (0, 1)] * 3 + [(1, 0), (0, 1)]
+    assert {e.code for r in results for e in r.rejected} == {"invalid_line"}
+    assert [r["v"] for r in rows(client, unique)] == [1, 2, 3, 4]
+    stats = client.stats().write
+    assert (stats.points_written, stats.points_failed, stats.points_dropped) == (4, 0, 4)
+    with pytest.raises(ValidationError) as info:  # on_invalid = "raise" (the default)
+        make_live_client().write(bad[0])
+    assert info.value.code == "invalid_line"
+
+
+def test_names_influxdb2_reads_differently(make_live_client: Any, unique: str) -> None:
+    """InfluxDB 2 keeps the backslash of "a\\ b" by escaping the space ("a\\\\ b"), which its line
+    splitting reads as an escaped backslash and a space: with a quote later, the line runs on.
+    The client rejects such points for InfluxDB 2; InfluxDB 3 escapes every backslash."""
+    client = make_live_client(write={"flush_interval": 60})
+    tricky = {"measurement": unique, "tags": {"a\\ b": '"c'}, "fields": {"v": 2}, "time": ts(2)}
+    first = client.write({"measurement": unique, "fields": {"v": 1}, "time": ts(1)})
+    if client.settings.connection.version == 2:
+        with pytest.raises(ValidationError) as info:
+            client.write(tricky)
+        assert info.value.code == "invalid_name"
+    else:
+        client.write(tricky)
+    last = client.write({"measurement": unique, "fields": {"v": 3}, "time": ts(3)})
+    client.flush(timeout=30)
+    assert (first.result(timeout=1).points, last.result(timeout=1).points) == (1, 1)
+    stored = [(r["v"], r.get("a\\ b")) for r in rows(client, unique)]
+    if client.settings.connection.version == 2:
+        assert stored == [(1, None), (3, None)]
+    else:
+        assert stored == [(1, None), (2, '"c'), (3, None)]
 
 
 def test_waiting_callers_share_requests(make_live_client: Any, unique: str) -> None:

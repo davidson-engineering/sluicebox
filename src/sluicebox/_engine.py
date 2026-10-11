@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 from . import _fork
 from . import futures as _futures
 from ._http import Transport, error_from_response, is_html, unexpected_page_error
-from ._lineprotocol import Dialect, LineSyntaxError, influxdb2_runs_on, parse_line
+from ._lineprotocol import Dialect, LineSyntaxError, line_end_problem, parse_line
 from ._retry import RetryPolicy
 from .exceptions import (
     BadRequestError,
@@ -247,7 +247,7 @@ def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], 
     other on new lines, the line without its leading whitespace. A line can contain newlines
     (in a string field value) and ``': ``, so the reason follows the last ``': ``.
 
-    A line that runs on into the next (:func:`influxdb2_runs_on`) is one of them, whatever the
+    A line that runs on into the next (:func:`line_end_problem`) is one of them, whatever the
     error says: the server quotes it together with the lines it runs into (with a reason that
     is about all of them), or parses them as one line without complaint. Taken out, it cannot
     join other lines when the rest is sent.
@@ -270,7 +270,7 @@ def _unparseable_lines(message: str, lines: list[str]) -> tuple[dict[int, str], 
             found[position] = quotes[key]
             seen.add(key)
             continue
-        runs_on = influxdb2_runs_on(line)
+        runs_on = line_end_problem(line)
         if key in heads:
             found[position] = runs_on or quotes[heads[key]]
             seen.add(heads[key])
