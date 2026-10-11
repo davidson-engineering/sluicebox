@@ -26,7 +26,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from ._lineprotocol import STRING_ESCAPES, Dialect, LineSyntaxError, UInt, parse_line
+from ._lineprotocol import STRING_ESCAPES, Dialect, LineSyntaxError, UInt, line_end_problem, parse_line
 from .exceptions import ValidationError
 from .log import RateLimitedLog
 from .point import Point
@@ -218,6 +218,9 @@ class Serializer:
         # With type locking every known field has a concrete expected type; without it,
         # undeclared fields have None and are written as their natural type.
         int_untyped_ok = not int_as_float
+        # InfluxDB 2 escapes a special character after a literal backslash as "\\ ", which its
+        # line splitting reads as an escaped backslash: such lines must be checked.
+        check_backslashes = self.dialect.version == 2
 
         for record in records:
             index += 1
@@ -356,6 +359,8 @@ class Serializer:
                     line = f"{head} {','.join(out)} {timestamp}"
                 else:
                     line = f"{head} {','.join(out)} {self._timestamp(timestamp, divisor, measurement)}"
+                if check_backslashes and "\\" in line:
+                    _check_v2_line_end(line, measurement)
                 if line.isascii():
                     nbytes += len(line) + 1
                 else:
@@ -1099,6 +1104,8 @@ class Serializer:
         if not candidates:
             return SerializedChunk([], 0, 0)
         if not self._validate_raw:
+            if '"' in text or "\\" in text:  # only these can carry a line into the next
+                _check_line_ends(self.dialect, candidates, "\n" in text)
             if now is not None:
                 # Untimed lines get the write() time too, so that a retry overwrites them.
                 stamp = f" {now}"
@@ -1140,13 +1147,57 @@ class Serializer:
         )
 
 
+def _check_line_ends(dialect: Dialect, lines: list[str], multiline: bool) -> None:
+    """Reject raw lines that the server would not end where the client does.
+
+    Lines of many ``write()`` calls are joined into one request, so a line that runs on into
+    the next (:func:`line_end_problem`) takes another call's line in: the server stores both as
+    one point or rejects them as one line, and the other call's point is lost without an error.
+    A line holding a newline (``multiline``: the text has one) is one line only because a
+    string field value spans the newline. Unless it parses, the value is a string left open
+    that a later line closed, swallowing the lines between.
+    """
+    for line in lines:
+        problem = line_end_problem(line)
+        if problem is None and multiline and "\n" in line:
+            try:
+                parse_line(dialect, line)
+            except LineSyntaxError as exc:
+                problem = f"a string value spans a line break, but the line it makes is invalid ({exc})"
+        if problem is not None:
+            raise ValidationError(f"invalid line protocol: {problem}: {line[:200]!r}", code="invalid_line")
+
+
+def _check_v2_line_end(line: str, measurement: str) -> None:
+    """Reject a line InfluxDB 2 would read differently, for the backslashes in its names.
+
+    InfluxDB 2 keeps a backslash before another character, so a measurement, tag or field key
+    ``a\\ b`` is written ``a\\\\ b``. Its line splitting, though, takes every backslash to
+    escape the next character: it reads an escaped backslash, then a space that starts the
+    fields. Quotes after it can then leave a string value open (or close one early), and the
+    line runs on into the next, or ends at a newline in a string value.
+    """
+    problem = line_end_problem(line)
+    if problem is not None:
+        raise ValidationError(
+            f"InfluxDB 2 would not read the line as written ({problem}): a backslash before a space, "
+            f"',' or '=' in the measurement, a tag or a field key is read as escaping something else; "
+            f"line {line[:200]!r}",
+            code="invalid_name",
+            measurement=measurement,
+        )
+
+
 def _with_timestamp(line: str, stamp: str) -> str:
     """Raw ``line`` with ``stamp`` (a space and the time) appended unless it has a timestamp.
 
     The timestamp is the last space-separated token: a field set always contains ``=``, and a
-    space inside a string field value is followed by its closing quote.
+    space inside a string field value is followed by its closing quote. A trailing space that a
+    backslash escapes is kept: the stamp must not become what the backslash escapes.
     """
     body = line.rstrip(" \t")
+    if body[-1:] == "\\" and (len(body) - len(body.rstrip("\\"))) % 2:
+        body = line[: len(body) + 1]
     tail = body[body.rfind(" ") + 1 :]
     if tail.isdigit() or (tail[:1] == "-" and tail[1:].isdigit()):
         return line

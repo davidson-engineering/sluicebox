@@ -307,7 +307,7 @@ Every record is checked while it is serialized, before anything is buffered:
 | Field type lock (`type_lock`) | The first type written for a field is kept; later values must match. Safe coercions apply (`coerce`): int to float, integral float to int. Booleans never become numbers. A record that is rejected locks nothing, nor does a DataFrame write in which no row is written. |
 | Server types | When the server rejects a value because it stores the field with another type, the lock follows the server's type. `client.sync_schema()` learns all stored types up front. |
 | Declared schemas | `[measurements.<name>]`: field types, allowed and required tags, required fields, `extra_fields = "forbid"`. `unknown_measurements = "reject"` allows only declared measurements. |
-| Identifiers | Escaped per server version; names that cannot round-trip are rejected (trailing backslash, control characters, reserved keys, `#`-prefixed measurements, `=` in InfluxDB 2 measurement names, tag/field name clashes on InfluxDB 3). |
+| Identifiers | Escaped per server version; names that cannot round-trip are rejected (trailing backslash, control characters, reserved keys, `#`-prefixed measurements, `=` in InfluxDB 2 measurement names, tag/field name clashes on InfluxDB 3, and on InfluxDB 2 a backslash before a space, `,` or `=` where the line would then not end where it is written). |
 | Values | int64/uint64 ranges, 1 MiB strings, NaN/inf (`non_finite`: `skip` the field, like pandas' missing values, or reject the record with `error`), timezone-naive datetimes (`naive_datetime`: reject or treat as UTC), ints that `int_as_float` cannot represent exactly. |
 | Timestamps | Range (1677-2262), and a warning for integers that look like the wrong unit. |
 | Records | Unknown keys in record dicts (`"tag"` instead of `"tags"`), records without fields. |
@@ -328,7 +328,16 @@ Raw line protocol is passed through unchanged by default (fastest), except that 
 timestamp get the `write()` time like any other point; `raw_lines = "validate"` parses it so
 validation and tag injection apply too. Either way, a newline inside a quoted string field value
 belongs to the value, so the output of `to_line_protocol()` and `WriteFailure.lines` can be
-written back as is.
+written back as is. Lines are never sent if the server would read them together with the
+next line, which could be another `write()` call's: a line that leaves a string value open
+(`m s="cut 17000`, e.g. truncated) or ends in a backslash, or one whose multi-line string
+value is not followed by a valid end of line (a string left open, then closed by the quote
+of a later line). Those are
+`invalid_line`, also when passed through: on the server they would take the lines after them
+along, without an error (see [Server behaviour](#server-behaviour-handled-for-you)). Only
+lines with a quote or a backslash need this check. A str or bytes is one record, so with
+`on_invalid = "drop"` an invalid line drops the text it is in; write lines one by one, or as
+a list, to keep the others.
 
 ```toml
 [validation]
@@ -577,12 +586,18 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
   line protocol is sent unvalidated by default) fails the whole batch, other `write()` calls'
   points included, and a replay of the dead-lettered batch fails again. Its HTTP 400 quotes each
   such line: sluicebox takes those out and sends the rest again, so every valid line is written
-  and only the bad ones fail, each for its own `write()` call. Lines the server reads together
-  with the next line (a string value left open, or a backslash at the end) are taken out too,
-  whether it complains about them or not: two of them can turn the lines between into one
-  string value. When the quotes do not match the lines sent, the request is halved instead, as
-  for HTTP 413. This costs at most 64 extra requests per batch, and a request the server may
-  have partly stored is never resent.
+  and only the bad ones fail, each for its own `write()` call. When the quotes do not match
+  the lines sent, the request is halved instead, as for HTTP 413. This costs at most 64 extra
+  requests per batch, and a request the server may have partly stored is never resent.
+- Both servers end a line at a newline only outside string values, and take a backslash to
+  escape any character, the newline too. A line leaving a string value open, or ending in a
+  backslash, therefore runs on into the next line of the request: InfluxDB 3 neither stores
+  nor reports the lines it swallows (`write_lp` named 1 error for 3 lines, and stored 1 of the
+  3 valid ones), and InfluxDB 2 stores two such lines and the lines between as one point with
+  HTTP 204. Lines from many `write()` calls share a request, so `write()` rejects such lines
+  (`invalid_line`), unvalidated raw line protocol too. InfluxDB 2 writes the backslash of a
+  name like `a\ b` as `a\\ b`, which its line splitting reads as an escaped backslash and a
+  space; points whose lines it would then read differently are rejected (`invalid_name`).
 - On InfluxDB 3, `/api/v3/write_lp` (the default for version 3) keeps the valid lines of a batch
   and names the rejected ones. `/api/v2/write` (`write.api = "v2"`) stores nothing of a request
   with one line it cannot parse, or that gives a column another type than its table has, and
@@ -590,8 +605,7 @@ Found by testing against InfluxDB 2.9 and InfluxDB 3.12, and handled or validate
   it cannot parse either, or that give the column the refused type, a request per table)
   apart from the others, which go in one request. Lines of one table that all give a field the
   refused type fail together, and their type conflict teaches the client the server's type.
-  Lines that may run on into the next go alone (two of them can be stored as one point,
-  swallowing the lines between). Otherwise the request is halved, which costs about
+  Otherwise the request is halved, which costs about
   2 x log2(lines) requests per refused line: about 30 in a 25,000-line batch. This matters
   because a request the server stores takes up to a second (it acknowledges on its WAL flush),
   while one it refuses takes milliseconds. The same limit of 64 extra requests per batch

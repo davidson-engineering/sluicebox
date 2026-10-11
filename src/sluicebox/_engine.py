@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any
 from . import _fork
 from . import futures as _futures
 from ._http import Transport, error_from_response, is_html, unexpected_page_error
-from ._lineprotocol import Dialect, LineSyntaxError, ParsedLine, UInt, influxdb2_runs_on, parse_line
+from ._lineprotocol import Dialect, LineSyntaxError, ParsedLine, UInt, parse_line
 from ._retry import RetryPolicy
 from .exceptions import (
     BadRequestError,
@@ -284,12 +284,8 @@ def _unparseable_lines(message: str, lines: Sequence[str]) -> tuple[dict[int, st
 
     The message holds ``unable to parse '<line>': <reason>`` for each such line, one after the
     other on new lines, the line without its leading whitespace. A line can contain newlines
-    (in a string field value) and ``': ``, so the reason follows the last ``': ``.
-
-    A line that runs on into the next (:func:`influxdb2_runs_on`) is one of them, whatever the
-    error says: the server quotes it together with the lines it runs into (with a reason that
-    is about all of them), or parses them as one line without complaint. Taken out, it cannot
-    join other lines when the rest is sent.
+    (in a string field value) and ``': ``, so the reason follows the last ``': ``. No line runs
+    on into the next (write() rejects those), so each quote is one line of the request.
     """
     quotes: dict[str, str] = {}
     complete = True
@@ -299,8 +295,6 @@ def _unparseable_lines(message: str, lines: Sequence[str]) -> tuple[dict[int, st
             quotes[text] = reason
         else:
             complete = False
-    # A quote of several lines begins with the line that runs on into the others.
-    heads = {text.partition("\n")[0]: text for text in quotes if "\n" in text}
     found: dict[int, str] = {}
     seen: set[str] = set()
     for position, line in enumerate(lines):
@@ -308,13 +302,6 @@ def _unparseable_lines(message: str, lines: Sequence[str]) -> tuple[dict[int, st
         if key in quotes:
             found[position] = quotes[key]
             seen.add(key)
-            continue
-        runs_on = influxdb2_runs_on(line)
-        if key in heads:
-            found[position] = runs_on or quotes[heads[key]]
-            seen.add(heads[key])
-        elif runs_on is not None:
-            found[position] = runs_on
     return found, complete and len(seen) == len(quotes)
 
 
@@ -917,8 +904,7 @@ class WriteEngine:
         (as in a partial write) and the others are sent again. If it quotes something that is
         not one of the lines sent, the lines are halved instead, as for HTTP 413, until the
         halves are written or down to single lines (see _resend for what that may cost).
-        As the server stored nothing of the request, resending never writes a line twice; as
-        no line that runs on into the next is sent again, the server reads the others as sent.
+        As the server stored nothing of the request, resending never writes a line twice.
         """
         found, complete = _unparseable_lines(error.message, lines)
         if not found and len(lines) == 1:
@@ -961,10 +947,9 @@ class WriteEngine:
         can be about are sent apart from the others, which go in one request: the lines the
         client cannot parse either, or those giving the column the type the server refused,
         a request per table. All lines of a request giving one table's field the refused type
-        of another field type fail together: the server's type came from none of them. Lines
-        that may run on into the next (an open string value or a trailing backslash) go alone,
-        so that none can join another line. Only when the client cannot tell which lines the
-        reason is about are the lines halved. Each request's error is handled the same way.
+        of another field type fail together: the server's type came from none of them. Only
+        when the client cannot tell which lines the reason is about are the lines halved. Each
+        request's error is handled the same way.
         """
         reason = error.message[len(_V3_REFUSED) :]
         if len(lines) == 1:
@@ -972,15 +957,12 @@ class WriteEngine:
             return
         conflict = _V3_COLUMN_CONFLICT.search(reason)
         others: list[int] = []
-        alone: list[Sequence[int]] = []
         suspects: dict[str, list[int]] = {}  # by table ("" for lines the client cannot parse)
         for position, line in enumerate(lines):
             try:
                 parsed = parse_line(self._dialect, line.lstrip(" \t"))
             except LineSyntaxError:
-                if '"' in line or line.endswith("\\"):
-                    alone.append((position,))
-                elif conflict is None:
+                if conflict is None:
                     suspects.setdefault("", []).append(position)
                 else:
                     others.append(position)
@@ -992,7 +974,6 @@ class WriteEngine:
         if (
             conflict is not None
             and not others
-            and not alone
             and len(suspects) == 1
             and conflict["expected"].startswith("field::")
             and conflict["got"].startswith("field::")
@@ -1001,7 +982,7 @@ class WriteEngine:
                 lines, indices, dict.fromkeys(range(len(lines)), reason), _refused_error, error, outcome
             )
             return
-        parts: list[Sequence[int]] = [part for part in (others, *suspects.values(), *alone) if part]
+        parts: list[Sequence[int]] = [part for part in (others, *suspects.values()) if part]
         if len(parts) > 1:
             log.debug(
                 "the server refused %d lines (%s); sending them in %d parts", len(lines), reason, len(parts)

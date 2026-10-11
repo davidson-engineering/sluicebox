@@ -4,7 +4,14 @@ import random
 
 import pytest
 
-from sluicebox._lineprotocol import Dialect, LineSyntaxError, UInt, influxdb2_runs_on, parse_line
+from sluicebox._lineprotocol import (
+    Dialect,
+    LineSyntaxError,
+    UInt,
+    _scan_line_end,
+    line_end_problem,
+    parse_line,
+)
 
 V2 = Dialect.for_version(2)
 V3 = Dialect.for_version(3)
@@ -175,5 +182,95 @@ RUN_ON = [
 
 
 @pytest.mark.parametrize(("line", "runs_on"), RUN_ON)
-def test_influxdb2_runs_on(line: str, runs_on: bool) -> None:
-    assert (influxdb2_runs_on(line) is not None) is runs_on
+def test_line_end_problem(line: str, runs_on: bool) -> None:
+    assert (line_end_problem(line) is not None) is runs_on
+    assert misread(line) is runs_on
+
+
+def scan_lines(text: str) -> list[str]:
+    """The lines of a request body as the servers read them (InfluxDB 2's models.scanLine,
+    ported literally; InfluxDB 3 splits the same way).
+
+    A newline inside a string field value does not end the line; a value left open runs on to
+    the next quote, or the end of the request. Lines lose their leading whitespace.
+    """
+    lines = []
+    i, n = 0, len(text)
+    while i < n:
+        start, quoted, fields, equals, commas = i, False, False, 0, 0
+        while i < n:
+            char = text[i]
+            if char == "\\" and i + 2 < n:
+                i += 2
+                continue
+            if char == " ":
+                fields = True
+            if fields and not quoted and char in "=,":
+                equals += char == "="
+                commas += char == ","
+            elif fields and char == '"' and equals > commas:
+                quoted = not quoted
+            elif char == "\n" and not quoted:
+                break
+            i += 1
+        line = text[start:i].lstrip(" \t\0")
+        if line and line[0] != "#":
+            lines.append(line)
+        i += 1
+    return lines
+
+
+def misread(line: str) -> bool:
+    """Whether the server, given ``line`` and another line, reads anything but those two lines.
+
+    The "x" before it changes no quote and keeps leading whitespace and comments as they are.
+    """
+    after = "after v=1i 1"
+    return scan_lines(f"x{line}\n{after}") != [f"x{line}", after]
+
+
+def random_lines(rng: random.Random, count: int) -> list[str]:
+    """Lines of random characters, and lines of random well- and ill-formed parts."""
+    chars = ["m", "k", "1", "=", ",", '"', " ", "\\", "\t", "\n"]
+    heads = ["m", "m\\ x", 'm"q', "m,t=a", 'm,t="a b', "m,t=a\\,b", "m,t=c:\\d", "  m", "#m", "m="]
+    fields = [
+        "v=1i",
+        "f=1.5",
+        's="x y"',
+        's="a=b,c"',
+        's=""',
+        "v=1i",
+        's="x y"',
+        's="a\\"b"',
+        's="a\\\\"',
+        's="open',
+        '"k"=1',
+        "k=v=1",
+        's="two\nlines"',
+    ]
+    fields += ['p="c:\\dir"', "f=1.5", "e=", 's=""', 'k"ey="v']
+    times = ["", " 1", "", " 1", ' "x', " 5\\", " 5\\\\", "\\", " 1 2", ' 1="']
+    lines = []
+    for _ in range(count):
+        if rng.random() < 0.3:
+            lines.append("".join(rng.choice(chars) for _ in range(rng.randint(0, 14))))
+        else:
+            parts = rng.choices(fields, k=rng.randint(1, 4))
+            lines.append(f"{rng.choice(heads)} {','.join(parts)}{rng.choice(times)}")
+    return lines
+
+
+def test_line_end_problem_reads_lines_as_the_server_does() -> None:
+    for line in random_lines(random.Random(7), 20_000):
+        assert (line_end_problem(line) is not None) is misread(line), line
+
+
+def test_the_common_case_is_read_without_the_scan() -> None:
+    """Lines without backslashes or newlines, with a space before the first quote, are read
+    with str methods: with the same result as the scan of each character."""
+    common = 0
+    for line in random_lines(random.Random(8), 20_000):
+        assert line_end_problem(line) == _scan_line_end(line), line
+        space, quote = line.find(" "), line.find('"')
+        common += "\\" not in line and "\n" not in line and 0 <= space < quote
+    assert common > 1_500  # an eighth of these lines
