@@ -21,7 +21,8 @@ built to drop into an application and push large volumes of data as fast as the 
 - **Configuration** in TOML, **secrets** only from the environment / `.env` / secret files (pydantic `SecretStr`).
 - **Prometheus metrics**, structured **logging**, per-stage **profiling** and a cProfile helper.
 - **Typed exceptions** for every failure, including per-line attribution of partial writes.
-- Sync and **asyncio** APIs; thread-safe (tested on free-threaded Python 3.14t); fork-aware.
+- Sync and **asyncio** APIs; thread-safe, and on free-threaded Python 3.14t writes from several
+  threads use several cores; fork-aware.
 
 Queries go through the official clients: Arrow Flight (SQL / InfluxQL) for InfluxDB 3 via
 `influxdb3-python`, Flux for InfluxDB 2 via `influxdb-client`. The write path uses its own
@@ -476,7 +477,10 @@ print(report.summary(limit=15))  # top functions, wall time, peak memory
 - **Telemetry that must never slow the application**: `on_full = "drop"` (drops are counted and
   logged). Pipelines that must not lose data keep `block` (with a `block_timeout`).
 - **Memory**: process memory can grow by about 3x `max_pending_bytes` while the buffer is full
-  (an outage); size it for the container's limit.
+  (an outage); size it for the container's limit. On free-threaded Python every thread that
+  writes also keeps serializer caches of its own (up to 50,000 serialized tag sets per
+  measurement and 200,000 escaped tag values): with many distinct series written from many
+  threads, that adds up.
 - **Outages**: batches are retried for `retry.max_elapsed` (5 minutes); meanwhile the buffer fills
   and backpressure applies.
 - **Processes**: create one client per process. With pre-fork servers (gunicorn) or
@@ -522,11 +526,15 @@ What matters most:
 - `write.no_sync = true` (InfluxDB 3 Core/Enterprise) acknowledges before the WAL is persisted:
   lower latency, weaker durability.
 - One client per process, shared by all threads, is the intended setup. Serialization of
-  records runs at about 1.15 M points/s on one core; threads do not add to that. On
-  free-threaded Python 3.14t they take away from it: threads writing through one client at
-  once contend for its shared state (eight writing one point per call reached half the rate
-  of one). To use more cores for serialization, write DataFrames (vectorized in Rust) or run
-  one client per process.
+  records runs at about 1.15 M points/s on one core. With the GIL, threads do not add to that:
+  to use more cores, write DataFrames (vectorized in Rust) or run one client per process. On
+  free-threaded Python (3.14t) threads do add: each thread that writes gets state of its own in
+  the client (a staging lane in the buffer, serializer caches), so threads writing at once
+  share no lock or object. One `write()` per point against a local sink went from 400 k points/s
+  on one thread to 1.1 M on four and 1.6 M on eight (`benchmarks/bench_client.py --threads
+  2,4,8`, Apple M5 Pro); before, eight threads reached half the rate of one. With
+  `write.concurrency = 1`, whose requests leave in the order the lines were written, all
+  threads share one lane.
 
 ## Remote servers, TLS and proxies
 

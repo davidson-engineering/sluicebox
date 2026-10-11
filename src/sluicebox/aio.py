@@ -25,7 +25,6 @@ from .exceptions import BufferFullError, ClientClosedError, ValidationError
 from .futures import MAX_REJECTED, WriteFuture
 from .point import Point
 from .tags import Enricher, tag_context
-from .types import PRECISION_DIVISORS
 
 if TYPE_CHECKING:
     import os
@@ -136,7 +135,7 @@ class AsyncInfluxClient:
             raise ClientClosedError("the client is closed")
         target = database or client._database
         prec = precision or client._precision
-        if prec not in PRECISION_DIVISORS:
+        if prec not in {"ns", "us", "ms", "s"}:
             raise ValueError(f"precision must be one of 'ns', 'us', 'ms', 's'; got {prec!r}")
         with tag_context(**tags) if tags else nullcontext():
             records = client._one_batch(data, measurement, tag_columns, field_columns, time_column)
@@ -162,21 +161,21 @@ class AsyncInfluxClient:
     ) -> WriteFuture:
         """Records that fit in one batch, serialized on the loop (they take microseconds)."""
         client = self._client
-        engine = client._engine
+        view, lane = client._thread_state()
         started = time.perf_counter()
         try:
-            chunk = client._serializer.serialize(records, database=database, precision=precision)
+            chunk = view.serialize(records, database=database, precision=precision)
         except ValidationError as error:
             client._metrics.error("write", error)
             raise
         elapsed = time.perf_counter() - started
-        future = WriteFuture(engine)
+        future = WriteFuture(lane)
         if chunk.dropped:
             future.dropped = chunk.dropped
             future.rejected = chunk.rejected[:MAX_REJECTED]
         while chunk.lines:
             try:
-                if engine.submit(
+                if lane.submit(
                     database,
                     precision,
                     chunk.lines,
@@ -190,7 +189,7 @@ class AsyncInfluxClient:
                 future.dropped += len(chunk.lines)  # on_full = "drop"
                 break
             except WouldBlock:
-                await asyncio.to_thread(engine.wait_for_space, chunk.nbytes)
+                await asyncio.to_thread(client._engine.wait_for_space, chunk.nbytes)
         future._seal()
         return future
 
@@ -199,7 +198,8 @@ class AsyncInfluxClient:
     ) -> WriteFuture:
         """Any other input, chunk by chunk (in a worker thread if ``offload``)."""
         engine = self._client._engine
-        future = WriteFuture(engine)
+        lane = self._client._thread_state()[1]  # the event loop thread's: submit() runs here
+        future = WriteFuture(lane)
         try:
             while True:
                 item = await asyncio.to_thread(next, chunks, _DONE) if offload else next(chunks, _DONE)
@@ -208,9 +208,7 @@ class AsyncInfluxClient:
                 _add_dropped(future, item)
                 while True:
                     try:
-                        if not engine.submit(
-                            database, precision, item.lines, item.nbytes, future, block=False
-                        ):
+                        if not lane.submit(database, precision, item.lines, item.nbytes, future, block=False):
                             future.dropped += len(item.lines)
                         break
                     except WouldBlock:

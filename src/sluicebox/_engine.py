@@ -2,9 +2,9 @@
 
 ``write()`` serializes on the caller's thread and hands lines to the engine, which:
 
-* appends them to an open batch per (database, precision), sealing it when it reaches
-  ``batch_size`` lines or ``max_batch_bytes``, or (via the flusher thread) once it is
-  ``flush_interval`` old;
+* appends them to an open batch per (database, precision) in the caller's lane, sealing it
+  when it reaches ``batch_size`` lines or ``max_batch_bytes``, or (via the flusher thread)
+  once it is ``flush_interval`` old;
 * lets ``concurrency`` sender threads gzip and POST sealed batches over a keep-alive
   connection pool, retrying transient failures with backoff and splitting batches the
   server rejects as too large (HTTP 413); a sender takes queued batches of the same
@@ -13,13 +13,22 @@
 * resolves each ``write()`` call's :class:`~sluicebox.futures.WriteFuture`, attributing
   per-line partial-write errors to the exact call (and line) that produced them.
 
+Lanes: lines wait for their batch to be sealed in a lane, which holds open batches, a lock
+and some reserved buffer space. On free-threaded Python every thread that writes has a lane
+of its own, so threads writing at once share no lock, list or counter until a batch is
+sealed (see ``_threads``); with the GIL and with ``concurrency = 1`` (whose requests must
+leave in the order the lines were written) all threads share one lane. A lane's lock also
+guards the futures of the writes buffered in it. Locks are taken in one order: a lane's,
+then the engine's (``_lock``), and never a lane's while holding the engine's.
+
 Threads are daemons, started on first use, re-created after ``fork()``, and the buffer is
 flushed at interpreter exit (``write.flush_on_exit``).
 
 Fork safety: a child process starts with only the thread that called ``fork()``. The engine
-locks (which also guard the engines' futures) are held across ``fork()``, so the child
-inherits consistent, unlocked state; the child then forgets the parent's buffers, threads and
-connections and fails the futures of data the parent is sending.
+locks are held across ``fork()``; batches enter and leave lanes and the queue under them, so
+the child inherits consistent state. It gives every lane a fresh lock (another thread may
+have held one), forgets the parent's buffers, threads and connections, and fails the futures
+of data the parent is sending.
 """
 
 from __future__ import annotations
@@ -37,7 +46,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from . import _fork
+from . import _fork, _threads
 from . import futures as _futures
 from ._http import Transport, error_from_response, is_html, unexpected_page_error
 from ._lineprotocol import Dialect, LineSyntaxError, parse_line
@@ -74,6 +83,17 @@ _V3_PRECISION = {"ns": "nanosecond", "us": "microsecond", "ms": "millisecond", "
 _MAX_RECORDED_FAILURES = 100
 #: A 413 for a request this small is not about its size (e.g. a proxy refusing all bodies).
 _MIN_SPLIT_BYTES = 1024
+#: Buffer space a lane reserves at a time: its thread then buffers that much without the
+#: engine lock (at most 1/256 of ``max_pending_bytes``).
+_CREDIT = 64 * 1024
+#: Futures released per hold of their lane's lock, so a sender never holds up a writing
+#: thread for long.
+_RELEASE_CHUNK = 512
+#: A lane that opened no batch for this long is unregistered (its thread may have ended);
+#: it registers again when written to.
+_RETIRE_AFTER = 30.0
+
+
 # Field type conflicts reported by the servers: (field, the type the server stores).
 _V3_TYPE_CONFLICT = re.compile(
     r"invalid column type for column '(?P<field>[^']+)', expected iox::column_type::field::(?P<type>\w+)"
@@ -122,6 +142,8 @@ class EngineStats:
     retries: int
     bytes_raw: int
     bytes_sent: int
+    #: Bytes buffered or in flight, plus buffer space that threads writing at that moment
+    #: have reserved and not used yet (at most 64 KiB each; none once their batches are sealed).
     buffered_bytes: int
     open_batches: int
     queued_batches: int
@@ -135,20 +157,31 @@ class _Batch:
         "database",
         "finished",
         "futures",
+        "lane",
         "lines",
+        "max_bytes",
         "nbytes",
+        "number",
         "offsets",
         "precision",
+        "runs",
         "sealed",
         "seqs",
         "serialize_time",
     )
 
-    def __init__(self, database: str, precision: str) -> None:
+    def __init__(
+        self, lane: _Lane, database: str, precision: str, number: int, created: float, max_bytes: int
+    ) -> None:
+        self.lane = lane
         self.database = database
         self.precision = precision
+        #: Tells this batch from later ones of the same lane, database and precision.
+        self.number = number
         self.lines: list[str] = []
         self.nbytes = 0
+        #: ``max_batch_bytes`` when the batch was opened (a 413 may lower it later).
+        self.max_bytes = max_bytes
         #: Caller-thread time spent serializing the lines of this batch (recorded once per batch).
         self.serialize_time = 0.0
         #: The futures of the write() calls with lines here, in line order: each call's lines
@@ -158,13 +191,174 @@ class _Batch:
         self.futures: list[WriteFuture] = []
         self.counts: list[int] = []
         self.offsets: list[int] = []
-        self.created = time.monotonic()
+        #: Batches merged from several lanes: (lane, number of futures) for each part, in
+        #: order. The lane's lock guards those futures. None: all are ``lane``'s.
+        self.runs: list[tuple[_Lane, int]] | None = None
+        self.created = created
+        #: When the batch was queued for sending (0.0 while open).
         self.sealed = 0.0
         #: Sequence numbers in ``_outstanding``: one per sealed batch merged into this one.
         self.seqs: list[int] = []
         #: Set (with the engine lock) by whoever reports the outcome: the sender, or close()
         #: when it gives up on a request that is still in flight.
         self.finished = False
+
+    def lane_runs(self) -> list[tuple[_Lane, int]]:
+        return self.runs if self.runs is not None else [(self.lane, len(self.futures))]
+
+
+def _fill(batch: _Batch, lines: list[str], nbytes: int, future: WriteFuture, seal: bool = False) -> None:
+    """Add a write's lines to an open batch (lock of the batch's lane held)."""
+    batch.futures.append(future)
+    batch.counts.append(len(lines))
+    batch.offsets.append(future.points)
+    future._attach(seal)
+    future.points += len(lines)
+    batch.lines += lines
+    batch.nbytes += nbytes
+
+
+class _Lane:
+    """Where writes wait for their batch to be sealed: open batches and reserved buffer space.
+
+    One per thread on free-threaded Python, otherwise one for all threads (see the module
+    docstring). ``lock`` guards ``open``, ``credit`` and ``usable``, and the state of the
+    futures of the writes buffered here. Batches enter and leave ``open`` with the engine lock
+    held as well, so the flusher can see which are open and fork() leaves no batch halfway.
+    """
+
+    __slots__ = ("__weakref__", "batch_size", "credit", "engine", "lock", "open", "opened", "seen", "usable")
+
+    def __init__(self, engine: WriteEngine) -> None:
+        self.engine = engine
+        self.lock = threading.Lock()
+        self.open: dict[tuple[str, str], _Batch] = {}
+        #: Buffer space reserved from ``max_pending_bytes`` and not used yet. Held only while
+        #: the lane has open batches: sealing the last one returns it.
+        self.credit = 0
+        #: False when submit() must take the slow path first: the lane is not registered with
+        #: the engine (new, idle for a while, inherited across fork()) or the engine is closing.
+        self.usable = False
+        self.batch_size = _threads.private(engine._batch_size)
+        #: Batches opened (with the engine lock), and that count when the flusher last looked.
+        self.opened = 0
+        self.seen = 0
+
+    def submit(
+        self,
+        database: str,
+        precision: str,
+        lines: list[str],
+        nbytes: int,
+        future: WriteFuture,
+        *,
+        block: bool = True,
+        serialize_time: float = 0.0,
+        seal: bool = False,
+    ) -> bool:
+        """Buffer ``lines`` for ``future``, whose lane this must be: see :meth:`WriteEngine.submit`.
+
+        The common case - room in the open batch and in the reserved space - takes only this
+        lane's lock.
+        """
+        if not lines:
+            if seal:
+                future._seal()
+            return True
+        with self.lock:
+            if self.usable and nbytes <= self.credit:
+                key = (database, precision)
+                batch = self.open.get(key)
+                if (
+                    batch is not None
+                    and len(batch.lines) + len(lines) <= self.batch_size
+                    and batch.nbytes + nbytes <= batch.max_bytes
+                ):
+                    self.credit -= nbytes
+                    _fill(batch, lines, nbytes, future, seal)
+                    batch.serialize_time += serialize_time
+                    if len(batch.lines) >= self.batch_size or batch.nbytes >= batch.max_bytes:
+                        self._seal(key, batch)
+                    return True
+        return self.engine._submit(
+            self, database, precision, lines, nbytes, future, block, serialize_time, seal
+        )
+
+    def _append(
+        self,
+        key: tuple[str, str],
+        lines: list[str],
+        nbytes: int,
+        future: WriteFuture,
+        seal: bool,
+        serialize_time: float,
+    ) -> None:
+        """Add lines whose space is already reserved, opening and sealing batches (lock held)."""
+        batch = self.open.get(key)
+        if batch is not None and (
+            len(batch.lines) + len(lines) > self.batch_size or batch.nbytes + nbytes > batch.max_bytes
+        ):
+            self._seal(key, batch, keep_credit=True)
+            batch = None
+        if len(lines) > self.batch_size or nbytes > self.engine._max_batch_bytes:
+            self._append_split(key, lines, nbytes, future, seal)
+            return
+        if batch is None:
+            batch = self.engine._open_batch(self, key)
+        _fill(batch, lines, nbytes, future, seal)
+        batch.serialize_time += serialize_time
+        if len(batch.lines) >= self.batch_size or batch.nbytes >= batch.max_bytes:
+            self._seal(key, batch)
+
+    def _append_split(
+        self, key: tuple[str, str], lines: list[str], nbytes: int, future: WriteFuture, seal: bool
+    ) -> None:
+        """Cut an oversized submission into batches that respect both size limits (lock held)."""
+        engine = self.engine
+        limit = engine._max_batch_bytes
+        piece: list[str] = []
+        piece_bytes = 0
+        total = 0
+        for line in lines:
+            size = (len(line) if line.isascii() else len(line.encode("utf-8"))) + 1
+            if piece and (len(piece) >= self.batch_size or piece_bytes + size > limit):
+                batch = engine._open_batch(self, key)
+                _fill(batch, piece, piece_bytes, future)
+                self._seal(key, batch, keep_credit=True)
+                piece = []
+                piece_bytes = 0
+            piece.append(line)
+            piece_bytes += size
+            total += size
+        if total != nbytes:
+            # The batches hold ``total`` bytes, which _finish releases: account for exactly that.
+            engine._adjust_pending(total - nbytes)
+        if piece:
+            batch = engine._open_batch(self, key)
+            _fill(batch, piece, piece_bytes, future, seal)
+            if len(batch.lines) >= self.batch_size or batch.nbytes >= batch.max_bytes:
+                self._seal(key, batch)
+
+    def _seal(self, key: tuple[str, str], batch: _Batch, keep_credit: bool = False) -> None:
+        """Queue an open batch for sending (lock held).
+
+        Sealing the last open batch returns the unused reserved space, unless ``keep_credit``
+        (another batch is opened right away).
+        """
+        returned = 0
+        if not keep_credit and len(self.open) == 1:
+            returned = self.credit
+            self.credit = 0
+        self.engine._enqueue(self, key, batch, returned)
+
+    def flush_nowait(self) -> None:
+        """Queue this lane's open batches for sending now."""
+        with self.lock:
+            for key, batch in list(self.open.items()):
+                self._seal(key, batch)
+            if self.credit:  # not expected (only open batches hold space), but never leak it
+                self.engine._adjust_pending(-self.credit)
+                self.credit = 0
 
 
 @dataclass(slots=True)
@@ -299,6 +493,15 @@ class WriteEngine:
         self._rate_log = RateLimitedLog(log)
         self._dropped_unlogged = 0  # points dropped (buffer full) since the last warning
         self._endpoints: dict[tuple[str, str], tuple[str, dict[str, str]]] = {}
+        self._credit = min(_CREDIT, self._max_pending // 256)
+        # Lanes live as long as their thread (or this engine), across fork() too.
+        # concurrency = 1 promises requests in the order the lines were written: one lane.
+        self._per_thread = _threads.per_thread() and self._concurrency > 1
+        self._local = threading.local()
+        #: Every lane alive (weakly: a thread's lane goes when the thread does), registered or
+        #: not, so that a forked child can replace their locks.
+        self._all_lanes: dict[int, weakref.ref[_Lane]] = {}
+        self._shared_lane = None if self._per_thread else self._new_lane()
         self._init_state()
         _ENGINES.add(self)
         _register_exit_flush()
@@ -311,7 +514,13 @@ class WriteEngine:
         self._progress = threading.Condition(self._lock)
         self._flusher_wake = threading.Condition(self._lock)
         self._stop = threading.Event()
-        self._open: dict[tuple[str, str], _Batch] = {}
+        #: Registered lanes: the ones that may hold open batches or reserved space.
+        self._lanes: set[_Lane] = set()
+        #: Open batches by age, as (lane, key, batch number), for the flusher. Sealed ones are
+        #: skipped (and dropped) when they come up.
+        self._expiring: deque[tuple[_Lane, tuple[str, str], int, float]] = deque()
+        self._open_count = 0
+        self._batch_number = 0
         self._queue: deque[_Batch] = deque()
         #: Queued batches per (database, precision), so a sender only looks for batches to
         #: take along when there are any.
@@ -343,6 +552,25 @@ class WriteEngine:
     # Producer side
     # ------------------------------------------------------------------------------------
 
+    def lane(self) -> _Lane:
+        """The lane the calling thread writes through (see the module docstring)."""
+        shared = self._shared_lane
+        if shared is not None:
+            return shared
+        local = self._local
+        try:
+            lane: _Lane = local.lane
+        except AttributeError:
+            lane = local.lane = self._new_lane()
+        return lane
+
+    def _new_lane(self) -> _Lane:
+        lane = _Lane(self)  # created (and so owned) by the thread that is going to write through it
+        key = id(lane)
+        lanes = self._all_lanes
+        lanes[key] = weakref.ref(lane, lambda _, key=key: lanes.pop(key, None))  # type: ignore[misc]
+        return lane
+
     def submit(
         self,
         database: str,
@@ -357,135 +585,156 @@ class WriteEngine:
     ) -> bool:
         """Buffer ``lines`` for ``future``. Returns False if they were dropped (buffer full).
 
-        With ``block=False`` a full buffer under the ``block`` policy raises :class:`WouldBlock`
-        (nothing is buffered) so asyncio callers can wait elsewhere via :meth:`wait_for_space`.
-        ``seal=True`` marks these as the last lines of the call, sealing the future with them
-        (the caller seals it on a False return or an exception).
+        The lines go to the future's lane. With ``block=False`` a full buffer under the
+        ``block`` policy raises :class:`WouldBlock` (nothing is buffered) so asyncio callers can
+        wait elsewhere via :meth:`wait_for_space`. ``seal=True`` marks these as the last lines
+        of the call, sealing the future with them (the caller seals it on a False return or an
+        exception).
         """
-        if not lines:
-            if seal:
-                future._seal()
-            return True
+        lane = future._lane
+        assert lane is not None, "a completed future cannot take lines"
+        assert lane.engine is self, "the future belongs to another client"
+        return lane.submit(
+            database, precision, lines, nbytes, future, block=block, serialize_time=serialize_time, seal=seal
+        )
+
+    def _submit(
+        self,
+        lane: _Lane,
+        database: str,
+        precision: str,
+        lines: list[str],
+        nbytes: int,
+        future: WriteFuture,
+        block: bool,
+        serialize_time: float,
+        seal: bool,
+    ) -> bool:
+        """The rest of :meth:`_Lane.submit`: register the lane, reserve space, open batches."""
+        key = (database, precision)
+        with lane.lock:
+            if not lane.usable:
+                self._register(lane)
+            if nbytes <= lane.credit:
+                lane.credit -= nbytes
+                lane._append(key, lines, nbytes, future, seal, serialize_time)
+                return True
+        # Reserving may wait for space: never with the lane's lock held, since the senders need
+        # it to release the futures of the batches whose completion frees the space.
+        granted = self._reserve(nbytes, len(lines), block)
+        if not granted:
+            return False
+        try:
+            with lane.lock:
+                if not lane.usable:
+                    self._register(lane)  # raises if close() began meanwhile
+                lane.credit += granted - nbytes
+                granted = 0
+                lane._append(key, lines, nbytes, future, seal, serialize_time)
+        finally:
+            if granted:
+                self._adjust_pending(-granted)
+        return True
+
+    def _register(self, lane: _Lane) -> None:
+        """Let the flusher, flush() and close() reach a lane about to buffer data (its lock held)."""
         with self._lock:
             if self._closing:
                 raise ClientClosedError("the client is closed; no further writes are accepted")
             if not self._threads:
                 self._start_threads()
-            if (
-                self._pending_bytes + nbytes > self._max_pending
-                and self._pending_bytes > 0
-                and not self._wait_for_space(nbytes, block)
-            ):
-                self._points_dropped += len(lines)
-                self._dropped_unlogged += len(lines)
-                self._metrics.points_dropped("buffer_full", len(lines))
-                if self._rate_log.log(
-                    "buffer_full",
-                    logging.WARNING,
-                    "write buffer full (%d bytes pending): dropped %d points since the last report "
-                    "(write.on_full = 'drop')",
-                    self._pending_bytes,
-                    self._dropped_unlogged,
-                    extra={"influx": {"client": self.name, "points": self._dropped_unlogged}},
-                ):
-                    self._dropped_unlogged = 0
-                return False
-            key = (database, precision)
-            count = len(lines)
-            batch = self._open.get(key)
-            if batch is not None and (
-                len(batch.lines) + count > self._batch_size or batch.nbytes + nbytes > self._max_batch_bytes
-            ):
-                self._seal(key, batch)
-                batch = None
-            if count > self._batch_size or nbytes > self._max_batch_bytes:
-                # Lines are re-measured there: count exactly what the batches hold, since
-                # _finish releases batch.nbytes.
-                self._pending_bytes += self._submit_split(key, lines, future, seal)
-            else:
-                self._pending_bytes += nbytes
-                if batch is None:
-                    batch = self._new_open_batch(key)
-                self._fill(batch, lines, nbytes, future, seal)
-                batch.serialize_time += serialize_time
-                if len(batch.lines) >= self._batch_size or batch.nbytes >= self._max_batch_bytes:
-                    self._seal(key, batch)
-        return True
+            self._lanes.add(lane)
+            lane.usable = True
 
-    def _new_open_batch(self, key: tuple[str, str]) -> _Batch:
-        batch = self._open[key] = _Batch(*key)
-        if len(self._open) == 1:
-            self._flusher_wake.notify()
-        return batch
+    def _reserve(self, nbytes: int, points: int, block: bool) -> int:
+        """Reserve buffer space for ``nbytes``, and some to spare if there is room.
 
-    def _submit_split(self, key: tuple[str, str], lines: list[str], future: WriteFuture, seal: bool) -> int:
-        """Cut an oversized submission into batches that respect both size limits.
-
-        Returns the bytes added to batches (UTF-8, newlines included).
+        Applies the overflow policy when the buffer is full. Returns the bytes reserved, or 0
+        if the points are to be dropped. No lane lock may be held.
         """
-        piece: list[str] = []
-        piece_bytes = 0
-        total = 0
-        for line in lines:
-            size = (len(line) if line.isascii() else len(line.encode("utf-8"))) + 1
-            if piece and (len(piece) >= self._batch_size or piece_bytes + size > self._max_batch_bytes):
-                batch = self._new_open_batch(key)
-                self._fill(batch, piece, piece_bytes, future)
-                self._seal(key, batch)
-                piece = []
-                piece_bytes = 0
-            piece.append(line)
-            piece_bytes += size
-            total += size
-        if piece:
-            batch = self._new_open_batch(key)
-            self._fill(batch, piece, piece_bytes, future, seal)
-            if len(batch.lines) >= self._batch_size or batch.nbytes >= self._max_batch_bytes:
-                self._seal(key, batch)
-        return total
+        with self._lock:
+            if self._closing:
+                raise ClientClosedError("the client is closed; no further writes are accepted")
+            granted = self._grant(nbytes)
+        if granted:
+            return granted
+        self._reclaim_credit()  # space that lanes reserved and have not used
+        with self._lock:
+            granted = self._grant(nbytes)
+            if granted:
+                return granted
+            if self._on_full == "drop":
+                self._count_full_drop(points)
+                return 0
+            if not block and self._on_full == "block":
+                raise WouldBlock
+            if self._on_full == "raise" or getattr(_SENDER, "engine", None) is self:
+                # Never block a sender thread (e.g. a callback that writes): nothing could drain the buffer.
+                raise BufferFullError(
+                    f"write buffer is full ({self._pending_bytes} of {self._max_pending} bytes pending)"
+                )
+        return self._wait_for_space(nbytes, reserve=True)
 
-    @staticmethod
-    def _fill(batch: _Batch, lines: list[str], nbytes: int, future: WriteFuture, seal: bool = False) -> None:
-        batch.futures.append(future)
-        batch.counts.append(len(lines))
-        batch.offsets.append(future.points)
-        future._attach(seal)
-        future.points += len(lines)
-        batch.lines += lines
-        batch.nbytes += nbytes
+    def _grant(self, nbytes: int) -> int:
+        """Reserve ``nbytes`` and up to one credit more if they fit (engine lock held), else 0.
 
-    def _wait_for_space(self, nbytes: int, block: bool = True) -> bool:
-        """Apply the overflow policy with the lock held; False means 'drop'."""
-        if self._on_full == "drop":
-            return False
-        if not block and self._on_full == "block":
-            raise WouldBlock
-        if self._on_full == "raise" or getattr(_SENDER, "engine", None) is self:
-            # Never block a sender thread (e.g. a callback that writes): nothing could drain the buffer.
-            raise BufferFullError(
-                f"write buffer is full ({self._pending_bytes} of {self._max_pending} bytes pending)"
-            )
+        A buffer holding nothing takes a write of any size: it could never fit otherwise.
+        """
+        pending = self._pending_bytes
+        if pending + nbytes > self._max_pending and pending > 0:
+            return 0
+        granted = nbytes + max(0, min(self._credit, self._max_pending - pending - nbytes))
+        self._pending_bytes = pending + granted
+        return granted
+
+    def _count_full_drop(self, points: int) -> None:
+        """Count points dropped because the buffer is full (engine lock held)."""
+        self._points_dropped += points
+        self._dropped_unlogged += points
+        self._metrics.points_dropped("buffer_full", points)
+        if self._rate_log.log(
+            "buffer_full",
+            logging.WARNING,
+            "write buffer full (%d bytes pending): dropped %d points since the last report "
+            "(write.on_full = 'drop')",
+            self._pending_bytes,
+            self._dropped_unlogged,
+            extra={"influx": {"client": self.name, "points": self._dropped_unlogged}},
+        ):
+            self._dropped_unlogged = 0
+
+    def _wait_for_space(self, nbytes: int, *, reserve: bool) -> int:
+        """Wait until ``nbytes`` fit in the buffer (no lock held), reserving them if ``reserve``.
+
+        Returns the bytes reserved (0 without ``reserve``).
+        """
         started = time.perf_counter()
         deadline = time.monotonic() + self._block_timeout if self._block_timeout else None
         while True:
-            # Checked after every wait: close() may have begun meanwhile, and nothing sends a
-            # batch opened after it sealed the buffer.
-            if self._closing:
-                raise ClientClosedError("the client was closed while waiting for buffer space")
-            if self._pending_bytes + nbytes <= self._max_pending or self._pending_bytes == 0:
-                break
-            remaining = None
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise BufferFullError(
-                        f"write buffer still full after {self._block_timeout} s "
-                        f"({self._pending_bytes} of {self._max_pending} bytes pending)"
-                    )
-            self._seal_all_open()  # make sure everything buffered is on its way
-            self._has_space.wait(remaining)
+            self._seal_lanes()  # make sure everything buffered is on its way
+            with self._lock:
+                # Checked after every wait: close() may have begun meanwhile, and nothing sends a
+                # batch opened after it sealed the lanes.
+                if self._closing:
+                    raise ClientClosedError("the client was closed while waiting for buffer space")
+                if reserve:
+                    granted = self._grant(nbytes)
+                    if granted:
+                        break
+                elif self._pending_bytes + nbytes <= self._max_pending or self._pending_bytes == 0:
+                    granted = 0
+                    break
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise BufferFullError(
+                            f"write buffer still full after {self._block_timeout} s "
+                            f"({self._pending_bytes} of {self._max_pending} bytes pending)"
+                        )
+                self._has_space.wait(remaining)
         self._stages.record("backpressure", time.perf_counter() - started)
-        return True
+        return granted
 
     def count_dropped(self, points: int) -> None:
         """Count points dropped before they reached the engine (invalid records)."""
@@ -494,31 +743,78 @@ class WriteEngine:
 
     def wait_for_space(self, nbytes: int) -> None:
         """Block until ``nbytes`` more fit in the buffer (honouring ``write.block_timeout``)."""
+        for attempt in range(2):
+            with self._lock:
+                if self._pending_bytes + nbytes <= self._max_pending or self._pending_bytes == 0:
+                    return
+            if attempt == 0:
+                self._reclaim_credit()
+        self._wait_for_space(nbytes, reserve=False)
+
+    def _open_batch(self, lane: _Lane, key: tuple[str, str]) -> _Batch:
+        """Open a batch in ``lane`` (its lock held)."""
         with self._lock:
-            if self._pending_bytes + nbytes > self._max_pending and self._pending_bytes > 0:
-                self._wait_for_space(nbytes)
+            self._batch_number += 1
+            batch = _Batch(
+                lane,
+                key[0],
+                key[1],
+                self._batch_number,
+                time.monotonic(),
+                _threads.private(self._max_batch_bytes),
+            )
+            lane.open[key] = batch
+            lane.opened += 1
+            self._open_count += 1
+            self._expiring.append((lane, key, batch.number, batch.created))
+            if len(self._expiring) == 1:
+                self._flusher_wake.notify()
+        return batch
 
-    def _seal(self, key: tuple[str, str], batch: _Batch) -> None:
-        """Queue a batch for sending (lock held). Buffer gauges are updated here, per batch."""
-        if self._open.get(key) is batch:
-            del self._open[key]
-        self._metrics.buffer(self._pending_bytes)
-        self._seq += 1
-        batch.seqs.append(self._seq)
-        batch.sealed = time.monotonic()
-        self._outstanding.add(self._seq)
-        self._queue.append(batch)
-        self._queued[key] = self._queued.get(key, 0) + 1
-        self._has_work.notify()
+    def _enqueue(self, lane: _Lane, key: tuple[str, str], batch: _Batch, returned: int) -> None:
+        """Move a sealed batch from its lane to the send queue, with ``returned`` bytes of the
+        lane's reserved space (lane lock held). Buffer gauges are updated here, per batch."""
+        with self._lock:
+            del lane.open[key]
+            self._open_count -= 1
+            if returned:
+                self._pending_bytes -= returned
+                self._has_space.notify_all()
+            self._seq += 1
+            batch.seqs.append(self._seq)
+            batch.sealed = time.monotonic()
+            self._outstanding.add(self._seq)
+            self._queue.append(batch)
+            self._queued[key] = self._queued.get(key, 0) + 1
+            self._has_work.notify()
+            self._metrics.buffer(self._pending_bytes)
 
-    def _seal_all_open(self) -> None:
-        for key, batch in list(self._open.items()):
-            self._seal(key, batch)
+    def _adjust_pending(self, delta: int) -> None:
+        with self._lock:
+            self._pending_bytes += delta
+            if delta < 0:
+                self._has_space.notify_all()
+
+    def _registered(self) -> list[_Lane]:
+        with self._lock:
+            return list(self._lanes)
+
+    def _seal_lanes(self) -> None:
+        """Queue every open batch for sending (no lock held)."""
+        for lane in self._registered():
+            lane.flush_nowait()
+
+    def _reclaim_credit(self) -> None:
+        """Take back the buffer space lanes have reserved and not used (no lock held)."""
+        for lane in self._registered():
+            with lane.lock:
+                if lane.credit:
+                    self._adjust_pending(-lane.credit)
+                    lane.credit = 0
 
     def flush_nowait(self) -> None:
         """Send all buffered data now without waiting for it."""
-        with self._lock:
-            self._seal_all_open()
+        self._seal_lanes()
 
     def check_wait_allowed(self, what: str) -> None:
         """Refuse to wait for this engine on one of its own sender threads.
@@ -544,8 +840,10 @@ class WriteEngine:
         """
         self.check_wait_allowed("flush()")
         deadline = time.monotonic() + timeout if timeout is not None else None
+        # Every write that returned before this call is in an open batch of a registered lane
+        # or already queued: sealing the lanes gives all of them sequence numbers up to target.
+        self._seal_lanes()
         with self._lock:
-            self._seal_all_open()
             target = self._seq
             while self._outstanding and min(self._outstanding) <= target:
                 remaining = None
@@ -605,20 +903,69 @@ class WriteEngine:
 
     def _flusher_loop(self) -> None:
         interval = self._flush_interval
-        with self._lock:
-            while not self._closing:
-                if not self._open:
-                    self._flusher_wake.wait()
+        next_retirement = time.monotonic() + _RETIRE_AFTER
+        while True:
+            with self._lock:
+                due = self._wait_for_expiry(interval)
+            if due is None:
+                return
+            for lane, key, number in due:
+                with lane.lock:
+                    batch = lane.open.get(key)
+                    if batch is not None and batch.number == number:
+                        lane._seal(key, batch)
+            if time.monotonic() >= next_retirement:
+                next_retirement = time.monotonic() + _RETIRE_AFTER
+                self._retire_idle_lanes()
+
+    def _wait_for_expiry(self, interval: float) -> list[tuple[_Lane, tuple[str, str], int]] | None:
+        """Wait until open batches are ``interval`` old and return them (engine lock held).
+
+        None means the engine is closing.
+        """
+        expiring = self._expiring
+        while not self._closing:
+            while expiring and not self._still_open(*expiring[0][:3]):
+                expiring.popleft()  # sealed meanwhile (full, flushed or waited for)
+            if not expiring:
+                self._flusher_wake.wait()
+                continue
+            now = time.monotonic()
+            wait = expiring[0][3] + interval - now
+            if wait > 0:
+                self._flusher_wake.wait(wait)
+                continue
+            due = []
+            while expiring and expiring[0][3] + interval <= now:
+                lane, key, number, _ = expiring.popleft()
+                if self._still_open(lane, key, number):
+                    due.append((lane, key, number))
+            return due
+        return None
+
+    @staticmethod
+    def _still_open(lane: _Lane, key: tuple[str, str], number: int) -> bool:
+        """Whether batch ``number`` is still open in ``lane`` (engine lock held)."""
+        batch = lane.open.get(key)
+        return batch is not None and batch.number == number
+
+    def _retire_idle_lanes(self) -> None:
+        """Unregister lanes that have opened no batch since the last look (their thread may be
+        gone): only registered lanes are visited by flush(), close() and waits for space."""
+        for lane in self._registered():
+            if lane is self._shared_lane:
+                continue
+            with lane.lock:
+                if lane.open or lane.opened != lane.seen:
+                    lane.seen = lane.opened
                     continue
-                now = time.monotonic()
-                oldest = min(batch.created for batch in self._open.values())
-                wait = oldest + interval - now
-                if wait > 0:
-                    self._flusher_wake.wait(wait)
-                    continue
-                for key, batch in list(self._open.items()):
-                    if batch.created + interval <= now:
-                        self._seal(key, batch)
+                with self._lock:
+                    self._lanes.discard(lane)
+                    lane.usable = False
+                    if lane.credit:  # not expected: only open batches hold space
+                        self._pending_bytes -= lane.credit
+                        lane.credit = 0
+                        self._has_space.notify_all()
 
     def _sender_loop(self) -> None:
         _SENDER.engine = self
@@ -680,6 +1027,13 @@ class WriteEngine:
     @staticmethod
     def _merge(batch: _Batch, other: _Batch) -> None:
         """Append the lines of ``other`` (and all its bookkeeping) to ``batch``."""
+        runs = batch.lane_runs()
+        for lane, count in other.lane_runs():
+            if runs[-1][0] is lane:
+                runs[-1] = (lane, runs[-1][1] + count)
+            else:
+                runs.append((lane, count))
+        batch.runs = runs
         batch.futures += other.futures
         batch.counts += other.counts
         batch.offsets += other.offsets
@@ -895,7 +1249,7 @@ class WriteEngine:
                 if not handled:
                     affected = tuple(f for f, e in zip(batch.futures, errors, strict=True) if e is not None)
                     unreported = _Unreported(outcome.failures[0].error, failed_lines, affected)
-            self._resolve_futures(batch.futures, errors, finished)
+            self._resolve_futures(batch, errors, finished)
         finally:
             with self._lock:
                 self._sending.discard(batch)
@@ -916,30 +1270,37 @@ class WriteEngine:
                             self._overflow_batches += 1
                 else:
                     self._batches_written += 1
-                pending = self._pending_bytes
-                inflight = len(self._sending)
                 self._has_space.notify_all()
                 self._progress.notify_all()
-            self._metrics.buffer(pending)
-            self._metrics.inflight(inflight)
+                # Under the lock, so that the last update wins and the gauges end up right.
+                self._metrics.buffer(self._pending_bytes)
+                self._metrics.inflight(len(self._sending))
 
-    def _resolve_futures(
-        self, futures: list[WriteFuture], errors: list[BaseException | None] | None, now: float
-    ) -> None:
+    @staticmethod
+    def _resolve_futures(batch: _Batch, errors: list[BaseException | None] | None, now: float) -> None:
         """Release a completed batch's futures (``errors``: one per future, or None for none).
 
-        Their state is updated under one hold of the engine lock; waiters are woken and
-        callbacks run after it, each on its own, so one callback cannot hold up the others.
+        Their state is updated under their lane's lock, a chunk at a time, so that a large
+        batch holds up its writing threads only briefly. Waiters are woken and callbacks run
+        afterwards, each on its own, so one callback cannot hold up the others.
         """
-        with self._lock:
-            if errors is None:
-                notify = [future for future in futures if future._release(None, now)]
-            else:
-                notify = [
-                    future
-                    for future, error in zip(futures, errors, strict=True)
-                    if future._release(error, now)
-                ]
+        futures = batch.futures
+        notify: list[WriteFuture] = []
+        start = 0
+        for lane, count in batch.lane_runs():
+            end = start + count
+            for low in range(start, end, _RELEASE_CHUNK):
+                high = min(end, low + _RELEASE_CHUNK)
+                with lane.lock:
+                    if errors is None:
+                        notify += [future for future in futures[low:high] if future._release(None, now)]
+                    else:
+                        notify += [
+                            future
+                            for future, error in zip(futures[low:high], errors[low:high], strict=True)
+                            if future._release(error, now)
+                        ]
+            start = end
         for future in notify:
             try:
                 future._complete()
@@ -1074,17 +1435,16 @@ class WriteEngine:
         """Flush buffered data (up to ``timeout``), stop the threads and return unreported failures."""
         self.check_wait_allowed("close()")
         timeout = self.close_timeout if timeout is None else timeout
+        self.begin_close(timeout)  # nothing to do if already closed
         with self._lock:
             if self._closed:
                 return None
-            self._begin_close(timeout)
             deadline = self._deadline or time.monotonic()
             while (self._queue or self._sending) and self._threads:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._progress.wait(remaining)
-            self._seal_all_open()  # nothing can be opened after _closing; this is a safety net
             abandoned = list(self._queue)
             self._queue.clear()
             self._queued.clear()
@@ -1132,16 +1492,23 @@ class WriteEngine:
         with self._lock:
             return self._take_failures()
 
-    def _begin_close(self, timeout: float) -> None:
-        """Stop accepting writes and send everything buffered (lock held)."""
-        if self._closing:
-            return
-        self._closing = True
-        self._deadline = time.monotonic() + timeout
-        self._seal_all_open()
-        self._has_work.notify_all()
-        self._flusher_wake.notify_all()
-        self._has_space.notify_all()
+    def begin_close(self, timeout: float) -> None:
+        """Stop accepting writes and queue everything buffered for sending, without waiting."""
+        with self._lock:
+            if not self._closing:
+                self._closing = True
+                self._deadline = time.monotonic() + timeout
+                self._has_work.notify_all()
+                self._flusher_wake.notify_all()
+                self._has_space.notify_all()
+            lanes = list(self._lanes)  # no lane registers once _closing is set
+        # A write that held a lane's lock before this has its lines in a batch sealed here; one
+        # that takes the lock afterwards finds the lane unusable and the engine closing.
+        for lane in lanes:
+            with lane.lock:
+                lane.usable = False
+                for key, batch in list(lane.open.items()):
+                    lane._seal(key, batch)
 
     @property
     def closed(self) -> bool:
@@ -1159,25 +1526,35 @@ class WriteEngine:
                 bytes_raw=self._bytes_raw,
                 bytes_sent=self._bytes_sent,
                 buffered_bytes=self._pending_bytes,
-                open_batches=len(self._open),
+                open_batches=self._open_count,
                 queued_batches=len(self._queue),
                 inflight_batches=len(self._sending),
             )
+
+    def _alive_lanes(self) -> list[_Lane]:
+        refs = self._all_lanes.copy()  # one atomic copy: lanes may come and go meanwhile
+        return [lane for ref in refs.values() if (lane := ref()) is not None]
 
     def _after_fork(self) -> None:
         """In a forked child: forget the parent's buffers, threads and connections."""
         if self._pid == os.getpid():
             return
-        inherited = [*self._open.values(), *self._queue, *self._sending]
+        lanes = self._alive_lanes()
+        inherited = [batch for lane in lanes for batch in lane.open.values()]
+        inherited += [*self._queue, *self._sending]
+        for lane in lanes:
+            lane.open = {}
+            lane.credit = 0
+            lane.usable = False  # registers with the child's state when written to
         self._init_state()
         self._transport.reset_after_fork()
         error = ClientClosedError("buffered in the parent process before fork(); the parent sends it")
         now = time.monotonic()
         for batch in inherited:
-            self._resolve_futures(batch.futures, [error] * len(batch.futures), now)
+            self._resolve_futures(batch, [error] * len(batch.futures), now)
 
 
-# The engines' locks (which also guard their futures) are held across fork(), in a fixed order.
+# The engines' locks are held across fork(), in a fixed order.
 _held_across_fork: list[threading.Lock] = []
 
 
@@ -1195,6 +1572,9 @@ def _after_fork_in_parent() -> None:
 
 def _release_in_child() -> None:
     _held_across_fork.clear()  # the engine locks are replaced by _after_fork
+    for engine in list(_ENGINES):
+        for lane in engine._alive_lanes():
+            lane.lock = threading.Lock()  # a thread that does not exist here may have held it
 
 
 def _reset_engines_in_child() -> None:
@@ -1218,8 +1598,7 @@ def _register_exit_flush() -> None:
 def _close_all_at_exit() -> None:
     engines = [engine for engine in list(_ENGINES) if engine.flush_on_exit and not engine.closed]
     for engine in engines:  # start all flushes first, so exit waits for the slowest, not the sum
-        with engine._lock:
-            engine._begin_close(engine.close_timeout)
+        engine.begin_close(engine.close_timeout)
     for engine in engines:
         try:
             failure = engine.close()

@@ -6,6 +6,7 @@ import itertools
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -14,10 +15,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 from . import _fork
-from ._engine import EngineStats, WriteEngine, WriteFailure
+from ._engine import EngineStats, WriteEngine, WriteFailure, _Lane
 from ._http import Transport, error_from_response, is_html, unexpected_page_error
 from ._lineprotocol import Dialect
-from ._serializer import SerializedChunk, Serializer
+from ._serializer import SerializedChunk, Serializer, _View
 from .config import InfluxSettings, load_settings
 from .exceptions import (
     BufferFullError,
@@ -33,7 +34,7 @@ from .point import Point
 from .profiling import ProfileReport, StageRecorder, StageStats, profile
 from .query import Language, QueryResult, V2QueryBackend, V3QueryBackend, run_query, stream_query
 from .tags import Enricher, TagInjector, tag_context
-from .types import PRECISION_DIVISORS, FieldType, Precision
+from .types import FieldType, Precision
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -139,8 +140,10 @@ class InfluxClient:
         self._metrics: Metrics = create_metrics(settings.metrics, settings.name, registry)
         self._stages = StageRecorder(settings.profiling.enabled, self._metrics.stage)
         self._dialect = Dialect.for_version(settings.connection.version)
-        self._database = settings.connection.database
-        self._precision: Precision = settings.write.precision
+        # Interned strings are immortal: threads use them on every write without contending
+        # for their reference counts (free-threaded Python).
+        self._database = sys.intern(settings.connection.database)
+        self._precision: Precision = sys.intern(settings.write.precision)  # type: ignore[assignment]
         self._chunk_size = settings.write.batch_size
         self._drop_log = RateLimitedLog(logging.getLogger("sluicebox.validation"))
         self._injector = TagInjector(settings.tags, static=tags, enrichers=enrichers)
@@ -164,6 +167,8 @@ class InfluxClient:
             on_error=on_error,
             on_type_conflict=self._learn_server_type,
         )
+        #: Per thread: the serializer view and engine lane its writes go through (_thread_state()).
+        self._local = threading.local()
         self._query_backend: V2QueryBackend | V3QueryBackend | None = None
         self._closed = False
         self._metrics.set_info(
@@ -258,7 +263,7 @@ class InfluxClient:
             raise ClientClosedError("the client is closed")
         target = database or self._database
         prec = precision or self._precision
-        if prec not in PRECISION_DIVISORS:
+        if prec not in {"ns", "us", "ms", "s"}:  # a constant: no shared dict to contend for
             raise ValueError(f"precision must be one of 'ns', 'us', 'ms', 's'; got {prec!r}")
         if tags:
             with tag_context(**tags):
@@ -303,25 +308,39 @@ class InfluxClient:
 
     def _write_records(self, records: Sequence[Any], database: str, precision: Precision) -> WriteFuture:
         """Records that fit in one batch: one serialize() and one submit(), no chunking machinery."""
+        view, lane = self._thread_state()
         started = time.perf_counter()
         try:
-            chunk = self._serializer.serialize(records, database=database, precision=precision)
+            chunk = view.serialize(records, database=database, precision=precision)
         except ValidationError as error:
             self._metrics.error("write", error)
             raise
         elapsed = time.perf_counter() - started
-        future = WriteFuture(self._engine)
+        future = WriteFuture(lane)
         if chunk.dropped:
             future.dropped = chunk.dropped
             future.rejected = chunk.rejected[:MAX_REJECTED]
         if not chunk.lines:
             future._seal()
-        elif not self._engine.submit(
+        elif not lane.submit(
             database, precision, chunk.lines, chunk.nbytes, future, serialize_time=elapsed, seal=True
         ):
             future.dropped += len(chunk.lines)
             future._seal()
         return future
+
+    def _thread_state(self) -> tuple[_View, _Lane]:
+        """The serializer view and engine lane the calling thread writes through.
+
+        On free-threaded Python every thread has its own (see ``_threads``), and reaches them
+        through a thread-local, which threads read without contending.
+        """
+        local = self._local
+        try:
+            state: tuple[_View, _Lane] = local.state
+        except AttributeError:
+            state = local.state = (self._serializer.view(), self._engine.lane())
+        return state
 
     def _chunks(
         self,
@@ -381,13 +400,14 @@ class InfluxClient:
             start += len(block)
 
     def _submit(self, chunks: Iterator[SerializedChunk], database: str, precision: Precision) -> WriteFuture:
-        future = WriteFuture(self._engine)
+        lane = self._thread_state()[1]
+        future = WriteFuture(lane)
         started = time.perf_counter()
         try:
             for chunk in chunks:
                 elapsed = time.perf_counter() - started
                 _add_dropped(future, chunk)
-                if chunk.lines and not self._engine.submit(
+                if chunk.lines and not lane.submit(
                     database, precision, chunk.lines, chunk.nbytes, future, serialize_time=elapsed
                 ):
                     future.dropped += len(chunk.lines)
@@ -433,7 +453,7 @@ class InfluxClient:
         """
         target = database or self._database
         prec = precision or self._precision
-        if prec not in PRECISION_DIVISORS:
+        if prec not in {"ns", "us", "ms", "s"}:
             raise ValueError(f"precision must be one of 'ns', 'us', 'ms', 's'; got {prec!r}")
         with tag_context(**tags) if tags else nullcontext():
             chunks = self._chunks(data, target, prec, measurement, tag_columns, field_columns, time_column)

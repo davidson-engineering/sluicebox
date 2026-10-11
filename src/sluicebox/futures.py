@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
     from contextlib import AbstractContextManager
 
-    from ._engine import WriteEngine
+    from ._engine import _Lane
 
 __all__ = ["WriteFuture", "WriteResult"]
 
@@ -35,7 +35,7 @@ MAX_REJECTED = 1000
 
 log = logging.getLogger("sluicebox.write")
 
-#: A future without an engine is complete from the start: nothing else can change it.
+#: A future without a lane is complete from the start: nothing else can change it.
 _UNSHARED = nullcontext()
 
 
@@ -62,10 +62,10 @@ class WriteFuture:
     __slots__ = (
         "_callbacks",
         "_done",
-        "_engine",
         "_errors",
         "_event",
         "_finished_at",
+        "_lane",
         "_observed",
         "_pending",
         "_sealed",
@@ -75,8 +75,9 @@ class WriteFuture:
         "rejected",
     )
 
-    def __init__(self, engine: WriteEngine | None) -> None:
-        self._engine = engine
+    def __init__(self, lane: _Lane | None) -> None:
+        #: Where the call's lines are buffered: its lock guards this future (see below).
+        self._lane = lane
         #: Lines handed to the engine for this call.
         self.points = 0
         #: Records dropped before sending.
@@ -98,15 +99,16 @@ class WriteFuture:
     # -- engine side ------------------------------------------------------------------------
     #
     # The state below (_pending, _sealed, _done, _errors, _event, _callbacks) is guarded by
-    # the engine's lock, which the engine already holds when it attaches or releases a
-    # future. Events are set and callbacks run outside of it (_complete).
+    # the lock of the lane the call's lines are buffered in, which the engine already holds
+    # when it attaches or releases a future. Events are set and callbacks run outside of it
+    # (_complete).
 
     def _lock(self) -> AbstractContextManager[Any]:
-        engine = self._engine
-        return engine._lock if engine is not None else _UNSHARED
+        lane = self._lane
+        return lane.lock if lane is not None else _UNSHARED
 
     def _attach(self, seal: bool = False) -> None:
-        """A batch now carries some of our lines (engine lock held).
+        """A batch now carries some of our lines (lane lock held).
 
         ``seal``: they are the last lines of this call. Unlike :meth:`_seal`, this cannot
         complete the future: the batch that carries them has not been sent yet.
@@ -116,7 +118,7 @@ class WriteFuture:
             self._sealed = True
 
     def _release(self, error: BaseException | None, now: float) -> bool:
-        """A batch carrying our lines completed at ``now`` (engine lock held).
+        """A batch carrying our lines completed at ``now`` (lane lock held).
 
         Returns True if that completed the future and there are waiters or callbacks: the
         caller then calls :meth:`_complete` once it has released the lock. (Registering one
@@ -212,8 +214,8 @@ class WriteFuture:
                 loop.call_soon_threadsafe(_resolve, waiter)
 
             self.add_done_callback(wake)
-            if not self._done and self._engine is not None:
-                self._engine.flush_nowait()
+            if not self._done and self._lane is not None:
+                self._lane.flush_nowait()
             yield from waiter.__await__()
         self._observed = True
         if self._errors:
@@ -231,13 +233,13 @@ class WriteFuture:
     def _wait(self, timeout: float | None) -> None:
         if self._done:
             return
-        engine = self._engine
-        if engine is not None:
-            engine.check_wait_allowed("waiting for a WriteFuture")
+        lane = self._lane
+        if lane is not None:
+            lane.engine.check_wait_allowed("waiting for a WriteFuture")
         warn_if_event_loop("WriteFuture.result()", "await the future instead")
         event = self._ensure_event()
-        if not self._done and engine is not None:
-            engine.flush_nowait()
+        if not self._done and lane is not None:
+            lane.flush_nowait()  # this call's lines are all in this lane
         if not event.wait(timeout):
             raise InfluxTimeoutError(
                 f"write not acknowledged within {timeout} s (it is still pending and may succeed later)"

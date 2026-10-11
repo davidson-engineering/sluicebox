@@ -32,13 +32,19 @@ jobs:
           # be compiled from source for an hour): test 3.14t without it.
           - python: "3.14t"
             skip: --no-install-package polars --no-install-package polars-runtime-32
+          # Per-thread write state (lanes, serializer views), as on 3.14t, with the GIL.
+          - python: "3.14 per-thread"
+            interpreter: "3.14"
+            per_thread: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
         with:
-          python-version: ${{ matrix.python }}
+          python-version: ${{ matrix.interpreter || matrix.python }}
       - run: uv sync --locked ${{ matrix.skip }}
       - run: uv run --no-sync pytest tests/unit
+        env:
+          SLUICEBOX_TEST_PER_THREAD: ${{ matrix.per_thread }}
 
   integration:
     runs-on: ubuntu-latest

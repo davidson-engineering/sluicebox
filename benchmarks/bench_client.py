@@ -7,7 +7,7 @@ does not compete with the client for the GIL. It counts the lines it receives an
 every write arrived exactly once (each line is unique, and their order-independent checksum
 must match).
 
-Run: uv run python benchmarks/bench_client.py [--points N] [--threads T]
+Run: uv run python benchmarks/bench_client.py [--points N] [--threads 2,4,8] [--only SUBSTRING]
 """
 
 from __future__ import annotations
@@ -74,7 +74,12 @@ def serve_sink(port: int) -> None:
             self.end_headers()
             self.wfile.write(body)
 
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    class Server(ThreadingHTTPServer):
+        # The client's 16 senders connect at once when a flush releases many batches: the
+        # default backlog of 5 drops connection attempts, which TCP retries a second later.
+        request_queue_size = 128
+
+    Server(("127.0.0.1", port), Handler).serve_forever()
 
 
 def make_points(n: int) -> list[dict[str, Any]]:
@@ -89,7 +94,7 @@ def make_points(n: int) -> list[dict[str, Any]]:
     ]
 
 
-def scenarios(threads: int) -> dict[str, Callable[[Any, list[dict[str, Any]]], None]]:
+def scenarios(thread_counts: list[int]) -> dict[str, Callable[[Any, list[dict[str, Any]]], None]]:
     def records(client: Any, points: list[dict[str, Any]]) -> None:
         client.write(points)
 
@@ -103,23 +108,27 @@ def scenarios(threads: int) -> dict[str, Callable[[Any, list[dict[str, Any]]], N
         for start in range(0, len(points), 10):
             write(points[start : start + 10])
 
-    def threaded(client: Any, points: list[dict[str, Any]]) -> None:
-        share = -(-len(points) // threads)
-        workers = [
-            threading.Thread(target=one_per_call, args=(client, points[i * share : (i + 1) * share]))
-            for i in range(threads)
-        ]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join()
+    def threaded(threads: int) -> Callable[[Any, list[dict[str, Any]]], None]:
+        def run(client: Any, points: list[dict[str, Any]]) -> None:
+            share = -(-len(points) // threads)
+            workers = [
+                threading.Thread(target=one_per_call, args=(client, points[i * share : (i + 1) * share]))
+                for i in range(threads)
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
+        return run
 
     found = {
         "write(list of dicts)": records,
         "one write() per point": one_per_call,
         "write() of 10 points at a time": lists_of_10,
-        f"one write() per point, {threads} threads": threaded,
     }
+    for threads in thread_counts:
+        found[f"one write() per point, {threads} threads"] = threaded(threads)
     try:
         import polars as pl
     except ImportError:
@@ -143,7 +152,8 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--points", type=int, default=300_000)
-    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--threads", default="8", help="thread counts, comma-separated (e.g. 2,4,8)")
+    parser.add_argument("--only", default="", help="run the scenarios whose name contains this")
     parser.add_argument("--port", type=int, default=18_998)
     parser.add_argument("--sink", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -169,7 +179,10 @@ def main() -> None:
         )
         points = make_points(args.points)
         print(f"{args.points:,} points (2 tags, 3 fields) to a local sink, Python {sys.version.split()[0]}\n")
-        for name, body in scenarios(args.threads).items():
+        thread_counts = [int(count) for count in args.threads.split(",")]
+        for name, body in scenarios(thread_counts).items():
+            if args.only not in name:
+                continue
             urllib.request.urlopen(urllib.request.Request(f"{url}/reset", data=b"", method="POST")).close()
             with InfluxClient(settings, registry=CollectorRegistry()) as client:
                 expected = client.to_line_protocol(points)

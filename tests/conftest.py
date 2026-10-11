@@ -13,6 +13,16 @@ from sluicebox import InfluxClient, InfluxSettings, WriteError, load_settings
 from tests.servers import deep_merge, server_client
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """SLUICEBOX_TEST_PER_THREAD=1 (or 0) runs the tests with per-thread write state on every
+    build (or on none): it is otherwise on only on free-threaded Python."""
+    choice = os.environ.get("SLUICEBOX_TEST_PER_THREAD")
+    if choice:
+        from sluicebox import _threads
+
+        _threads.PER_THREAD = choice == "1"
+
+
 @pytest.fixture(autouse=True)
 def _isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     """No developer SLUICEBOX_* variables, .env or sluicebox.toml can leak into a test."""
