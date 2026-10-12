@@ -426,6 +426,31 @@ class TestLifecycle:
         # The child connected anew instead of sharing the inherited socket, which outlived it.
         assert [r.connection for r in fake.write_requests] == [1, 2, 1]
 
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+    def test_forked_child_writes_while_a_parent_thread_records_metrics(
+        self, fake: FakeInflux, client_for: Any
+    ) -> None:
+        """A sender recording a batch's metrics when another thread forks holds a metric's lock,
+        which no thread releases in the child: the child's sender must not wait for it."""
+        client = client_for()
+        client.write(points(1)).result(timeout=5)
+        held = client._metrics._batch_points._sum._lock  # prometheus_client's lock of one value
+        held.acquire()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # "process is multi-threaded" (expected here)
+            pid = os.fork()
+        if pid == 0:  # child
+            code = 1
+            try:
+                client.write(points(1, start=10)).result(timeout=10)
+                code = 0
+            finally:
+                os._exit(code)
+        held.release()
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0, "the child's write was never acknowledged"
+        assert fake.lines == ["m v=0.0 0", "m v=10.0 10"]
+
     def test_stats_and_futures(self, fake: FakeInflux, client_for: Any) -> None:
         client = client_for()
         result = client.write(points(10)).result(timeout=5)

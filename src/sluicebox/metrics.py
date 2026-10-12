@@ -83,6 +83,38 @@ _fork.on_child(locks=_new_families_lock)
 _families: weakref.WeakKeyDictionary[CollectorRegistry, dict[str, _Families]] = weakref.WeakKeyDictionary()
 _exporters: dict[tuple[str, int], Any] = {}
 
+_LOCK_TYPES = {type(threading.Lock()): threading.Lock, type(threading.RLock()): threading.RLock}
+
+
+def _new_metric_locks() -> None:
+    """Give the metrics of every family fresh locks in a forked child.
+
+    prometheus_client guards each metric (adding a label set) and each value with a lock of
+    its own. A sender recording a batch while another thread forks holds one, and it would
+    stay locked in the child: the child's sender would wait for it forever.
+    """
+    for by_namespace in list(_families.values()):
+        for families in by_namespace.values():
+            for metric in vars(families).values():
+                for owner in (metric, *getattr(metric, "_metrics", {}).values()):
+                    _renew_locks(owner)
+
+
+def _renew_locks(owner: Any) -> None:
+    """Replace the locks among ``owner``'s attributes, and those of its values (or lists of them)."""
+    for name, value in list(vars(owner).items()):
+        new = _LOCK_TYPES.get(type(value))
+        if new is not None:
+            setattr(owner, name, new())
+            continue
+        for item in value if isinstance(value, list) else (value,):
+            new = _LOCK_TYPES.get(type(getattr(item, "_lock", None)))
+            if new is not None:
+                item._lock = new()
+
+
+_fork.on_child(locks=_new_metric_locks)
+
 
 class _Families:
     def __init__(self, namespace: str, registry: CollectorRegistry) -> None:
