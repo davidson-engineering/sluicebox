@@ -309,12 +309,18 @@ class _Lane:
     ) -> None:
         """Add lines whose space is already reserved, opening and sealing batches (lock held)."""
         batch = self.open.get(key)
+        # Lines too many or too large for one batch get batches of their own. A 413 may have
+        # lowered the limit since the open batch was opened, so lines it would still take can
+        # be split too: it is sealed first, as opening another batch would replace it.
+        split = len(lines) > self.batch_size or nbytes > self.engine._max_batch_bytes
         if batch is not None and (
-            len(batch.lines) + len(lines) > self.batch_size or batch.nbytes + nbytes > batch.max_bytes
+            split
+            or len(batch.lines) + len(lines) > self.batch_size
+            or batch.nbytes + nbytes > batch.max_bytes
         ):
             self._seal(key, batch, keep_credit=True)
             batch = None
-        if len(lines) > self.batch_size or nbytes > self.engine._max_batch_bytes:
+        if split:
             self._append_split(key, lines, nbytes, future, seal)
             return
         if batch is None:
@@ -873,6 +879,7 @@ class WriteEngine:
 
     def _open_batch(self, lane: _Lane, key: tuple[str, str]) -> _Batch:
         """Open a batch in ``lane`` (its lock held)."""
+        assert key not in lane.open, "the open batch would be lost"
         with self._lock:
             self._batch_number += 1
             batch = _Batch(

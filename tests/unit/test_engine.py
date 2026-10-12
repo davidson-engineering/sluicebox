@@ -220,6 +220,22 @@ class TestFailures:
         engine._learn_size_limit(39_000)  # built under the learned limit: learn again
         assert engine._max_batch_bytes == 19_500
 
+    def test_a_write_split_for_a_learned_limit_keeps_the_open_batch(
+        self, fake: FakeInflux, client_for: Any
+    ) -> None:
+        """A 413 lowers the limit while a batch opened under the old one is still open: a write
+        too large for the new limit is split into batches of its own, and the open one is sent too."""
+        client = client_for(write={"max_batch_bytes": 100_000, "flush_interval": 60, "gzip": False})
+        pad = "x" * 600
+        first = client.write({"measurement": "m", "fields": {"s": pad}, "time": 0})
+        client._engine._learn_size_limit(80_000)  # now 40,000; the open batch keeps 100,000
+        # About 92 KB: fits the open batch, but not the new limit (nor the space reserved ahead).
+        records = [{"measurement": "m", "fields": {"s": pad}, "time": i} for i in range(1, 151)]
+        assert client.write(records).result(timeout=5).points == 150
+        assert first.result(timeout=5).points == 1
+        assert sorted(fake.lines) == sorted(f'm s="{pad}" {i}' for i in range(151))
+        assert client.stats().write.buffered_bytes == 0
+
     def test_413_for_tiny_requests_is_not_split_further(self, fake: FakeInflux, client_for: Any) -> None:
         fake.responder = lambda _: Reply(413, {"code": "request too large", "message": "max"})
         client = client_for()
