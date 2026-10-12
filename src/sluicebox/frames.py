@@ -15,9 +15,10 @@ import importlib.util
 import logging
 import math
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
-from ._serializer import SerializedChunk, _undo
+from ._serializer import SerializedChunk
 from .exceptions import ConfigurationError, ValidationError
 from .point import Point
 from .tags import _CONTEXT_TAGS
@@ -36,6 +37,7 @@ log = logging.getLogger("sluicebox.validation")
 
 _INT64_MAX = 2**63 - 1
 _FLOAT_EXACT_INT = 2**53
+_INTEGER_TYPES = (FieldType.INTEGER, FieldType.UINTEGER)
 _CONTROL_PATTERN = r"[\x00-\x1f\x7f]"
 #: Per-row errors reported for one chunk of dropped rows (the count is always exact).
 _MAX_ROW_ERRORS = 1000
@@ -168,6 +170,17 @@ class _Invalid:
         self.checks.append((mask, code, message, key))
 
 
+@dataclass
+class _Pending:
+    """Field type locks and tag and field keys new to the measurement that the expressions
+    assume: made (``Serializer.commit``) once a row gets written, as a rejected record locks
+    nothing."""
+
+    locks: dict[str, FieldType] = field(default_factory=dict)
+    tag_keys: list[str] = field(default_factory=list)
+    field_keys: list[str] = field(default_factory=list)
+
+
 def _polars_chunks(
     frame: pl.DataFrame,
     serializer: Serializer,
@@ -197,13 +210,12 @@ def _polars_chunks(
     if frame.height == 0:
         return
 
-    # Field type locks and tag/field key registrations made while building the expressions:
-    # undone unless a row gets written (a rejected record locks nothing).
-    journal: list[tuple[Any, Any]] = []
-    try:
+    start = 0
+    while True:
+        assumed = _Pending()
         invalid = _Invalid()
-        tag_expr = _tag_expression(frame, serializer, plan, tags, fields, invalid, journal)
-        field_expr = _field_expression(frame, serializer, plan, fields, invalid, journal)
+        tag_expr = _tag_expression(frame, serializer, plan, tags, fields, invalid, assumed)
+        field_expr = _field_expression(frame, serializer, plan, fields, invalid, assumed)
         stamp = _time_expression(frame, serializer, precision, time_col, invalid)
         invalid.add(field_expr == "", "no_fields", "record has no fields (all were null, NaN or missing)")
         for key in plan.required_fields:
@@ -219,23 +231,30 @@ def _polars_chunks(
         line = pl.concat_str(parts)
         any_invalid = pl.any_horizontal([mask.fill_null(False) for mask, *_ in invalid.checks])
 
-        for offset in range(0, frame.height, chunk_size):
+        pending: _Pending | None = assumed
+        for offset in range(start, frame.height, chunk_size):
             chunk = frame.slice(offset, chunk_size)
             result = chunk.select(line.alias("line"), any_invalid.alias("invalid"))
+            invalid_rows = result["invalid"]
+            if serializer._raise and invalid_rows.any():
+                _handle_invalid(chunk, serializer, invalid, plan.measurement, offset)  # raises
+            if pending is not None and not invalid_rows.all():
+                # Rows are about to be written with these locks and keys: make them.
+                if not serializer.commit(plan, pending.locks, pending.tag_keys, pending.field_keys):
+                    start = offset  # another thread decided otherwise: build the expressions again
+                    break
+                pending = None
             dropped = 0
             rejected: list[ValidationError] = []
-            if result["invalid"].any():
+            if invalid_rows.any():
                 dropped, rejected = _handle_invalid(chunk, serializer, invalid, plan.measurement, offset)
                 result = result.filter(~pl.col("invalid"))
             lines_series = result["line"]
             lines = lines_series.to_list()
             nbytes = int(lines_series.str.len_bytes().sum() or 0) + len(lines)
-            if lines:
-                journal.clear()  # rows are written with these locks: keep them
             yield SerializedChunk(lines, nbytes, dropped, rejected)
-    finally:
-        if journal:
-            _undo(journal)
+        else:
+            return
 
 
 def _handle_invalid(
@@ -331,7 +350,7 @@ def _tag_expression(
     tags: list[str],
     fields: list[str],
     invalid: _Invalid,
-    journal: list[tuple[Any, Any]],
+    pending: _Pending,
 ) -> pl.Expr:
     import polars as pl
 
@@ -341,7 +360,7 @@ def _tag_expression(
     injected: dict[str, str] = {**injector.static, **context} if context else dict(injector.static)
     columns: dict[str, pl.Expr] = {}
     for name in tags:
-        _check_tag_key(serializer, plan, name, fields, journal)
+        _check_tag_key(serializer, plan, name, fields, pending)
         values = _as_tag_strings(frame, name, plan, invalid)
         present = values.is_not_null() & (values != "")
         invalid.add(
@@ -372,7 +391,7 @@ def _tag_expression(
                 )
                 columns[key] = pl.coalesce(existing, literal)
         else:
-            _check_tag_key(serializer, plan, key, fields, journal)
+            _check_tag_key(serializer, plan, key, fields, pending)
             columns[key] = literal
     if plan.allowed_tags is not None:
         for key, expr in columns.items():
@@ -398,7 +417,7 @@ def _tag_expression(
 
 
 def _check_tag_key(
-    serializer: Serializer, plan: _Plan, key: str, fields: list[str], journal: list[tuple[Any, Any]]
+    serializer: Serializer, plan: _Plan, key: str, fields: list[str], pending: _Pending
 ) -> None:
     dialect = serializer.dialect
     problem = dialect.identifier_problem(key)
@@ -422,7 +441,8 @@ def _check_tag_key(
                 key=key,
             )
         if key not in plan.tag_keys:
-            serializer._register_tag_key(plan, key, journal)
+            serializer.check_tag_key(plan, key)
+            pending.tag_keys.append(key)
 
 
 def _natural_type(dtype: Any, key: str, measurement: str) -> FieldType | None:
@@ -454,7 +474,7 @@ def _field_expression(
     plan: _Plan,
     fields: list[str],
     invalid: _Invalid,
-    journal: list[tuple[Any, Any]],
+    pending: _Pending,
 ) -> pl.Expr:
     import polars as pl
 
@@ -464,8 +484,9 @@ def _field_expression(
         source = _natural_type(dtype, key, plan.measurement)
         if source is None:
             continue  # an all-null column carries no fields
-        info = plan.fields.get(key)
-        prefix = info[0] if info is not None else serializer._new_field_key(plan, key, None)
+        prefix = serializer.field_prefix(plan, key, None)
+        if serializer._check_overlap and key not in plan.field_keys:
+            pending.field_keys.append(key)
         col = pl.col(key)
         if isinstance(dtype, pl.Decimal):
             if not serializer._coerce:
@@ -478,22 +499,14 @@ def _field_expression(
                 )
             col = col.cast(pl.Float64)
         natural = source
-        integer_field = plan.types.get(key) in (FieldType.INTEGER, FieldType.UINTEGER)
-        if source is FieldType.INTEGER and serializer._int_as_float and not integer_field:
+        expected = plan.types.get(key)  # as decided so far: the commit checks it again
+        if source is FieldType.INTEGER and serializer._int_as_float and expected not in _INTEGER_TYPES:
             natural = FieldType.FLOAT
-        expected = plan.types.get(key)
         if expected is None:
             if serializer._lock_types:
-                expected = plan.types.setdefault(key, natural)
-                if expected is natural:
-                    journal.append((plan.types, key))
-            else:
-                expected = natural
+                pending.locks[key] = natural  # a new field: locked to this type once a row is written
+            expected = natural
         value, formatted = _format_field(col, source, natural, expected, key, plan, serializer, invalid)
-        if info is None:
-            entry = (prefix, plan.types.get(key))
-            if plan.fields.setdefault(key, entry) is entry:
-                journal.append((plan.fields, key))
         fragments.append(pl.when(value.is_not_null()).then(pl.lit(prefix) + formatted))
     if not fragments:
         return pl.lit("")

@@ -220,6 +220,22 @@ class TestFailures:
         engine._learn_size_limit(39_000)  # built under the learned limit: learn again
         assert engine._max_batch_bytes == 19_500
 
+    def test_a_write_split_for_a_learned_limit_keeps_the_open_batch(
+        self, fake: FakeInflux, client_for: Any
+    ) -> None:
+        """A 413 lowers the limit while a batch opened under the old one is still open: a write
+        too large for the new limit is split into batches of its own, and the open one is sent too."""
+        client = client_for(write={"max_batch_bytes": 100_000, "flush_interval": 60, "gzip": False})
+        pad = "x" * 600
+        first = client.write({"measurement": "m", "fields": {"s": pad}, "time": 0})
+        client._engine._learn_size_limit(80_000)  # now 40,000; the open batch keeps 100,000
+        # About 92 KB: fits the open batch, but not the new limit (nor the space reserved ahead).
+        records = [{"measurement": "m", "fields": {"s": pad}, "time": i} for i in range(1, 151)]
+        assert client.write(records).result(timeout=5).points == 150
+        assert first.result(timeout=5).points == 1
+        assert sorted(fake.lines) == sorted(f'm s="{pad}" {i}' for i in range(151))
+        assert client.stats().write.buffered_bytes == 0
+
     def test_413_for_tiny_requests_is_not_split_further(self, fake: FakeInflux, client_for: Any) -> None:
         fake.responder = lambda _: Reply(413, {"code": "request too large", "message": "max"})
         client = client_for()
@@ -409,6 +425,31 @@ class TestLifecycle:
         assert sorted(fake.lines) == ["m v=0.0 0", "m v=1.0 1", "m v=10.0 10", "m v=20.0 20"]
         # The child connected anew instead of sharing the inherited socket, which outlived it.
         assert [r.connection for r in fake.write_requests] == [1, 2, 1]
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+    def test_forked_child_writes_while_a_parent_thread_records_metrics(
+        self, fake: FakeInflux, client_for: Any
+    ) -> None:
+        """A sender recording a batch's metrics when another thread forks holds a metric's lock,
+        which no thread releases in the child: the child's sender must not wait for it."""
+        client = client_for()
+        client.write(points(1)).result(timeout=5)
+        held = client._metrics._batch_points._sum._lock  # prometheus_client's lock of one value
+        held.acquire()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # "process is multi-threaded" (expected here)
+            pid = os.fork()
+        if pid == 0:  # child
+            code = 1
+            try:
+                client.write(points(1, start=10)).result(timeout=10)
+                code = 0
+            finally:
+                os._exit(code)
+        held.release()
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0, "the child's write was never acknowledged"
+        assert fake.lines == ["m v=0.0 0", "m v=10.0 10"]
 
     def test_stats_and_futures(self, fake: FakeInflux, client_for: Any) -> None:
         client = client_for()

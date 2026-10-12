@@ -565,7 +565,7 @@ class TestBookkeeping:
         assert _runs([0, 1, 2, 5, 7, 8]) == [(0, 3), (5, 6), (7, 9)]
 
     def test_each_future_gets_the_failures_among_its_lines(self) -> None:
-        batch = _Batch("db", "ns")
+        batch = _Batch(None, "db", "ns", 0, 0.0, 0)  # type: ignore[arg-type]  # no lane: only lines are read
         for count in (2, 3, 1, 4, 2):  # five write() calls: lines 0-1, 2-4, 5, 6-9, 10-11
             batch.futures.append(WriteFuture(None))
             batch.counts.append(count)

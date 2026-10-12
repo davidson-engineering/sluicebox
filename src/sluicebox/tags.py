@@ -33,6 +33,9 @@ __all__ = ["Enricher", "TagInjector", "current_context_tags", "tag_context"]
 Enricher: TypeAlias = Callable[[str, Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any] | None]
 
 _CONTEXT_TAGS: ContextVar[Mapping[str, str] | None] = ContextVar("sluicebox_context_tags", default=None)
+#: Whether tag_context() was ever used: until then the serializer does not read _CONTEXT_TAGS,
+#: which every thread shares (and would contend for on free-threaded Python, see _threads).
+_context_used = False
 
 
 @contextmanager
@@ -48,6 +51,8 @@ def tag_context(**tags: str) -> Iterator[None]:
     >>> with tag_context(tenant="acme", region="eu-west-1"):
     ...     client.write(points)  # doctest: +SKIP
     """
+    global _context_used
+    _context_used = True  # before the variable is set, so that no write misses it
     current = _CONTEXT_TAGS.get()
     merged = {**current, **tags} if current else dict(tags)
     token = _CONTEXT_TAGS.set(merged)

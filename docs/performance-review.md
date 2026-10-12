@@ -96,6 +96,101 @@ DataFrames (lists +2%). One `write()` per point went from 217 k to 260 k points/
 (+20%), and from 210 k to 217 k on InfluxDB 3, whose WAL bounds it, with the calling thread
 busy 22% less.
 
+## Writes from many threads on free-threaded Python
+
+Recommendation 1 of the review below, done in a follow-up change.
+
+**The problem, reproduced.** On 3.14t, one `write()` per point (`bench_client.py`, local sink)
+went 394 k points/s on one thread, 270 k on two, 255 k on four and 198 k on eight.
+`submit()` alone (pre-serialized one-line writes, no network) went 1.56 M/s on one thread and
+503 k/s on eight; a serializer shared by eight threads 685 k -> 563 k points/s.
+
+**The cause was mostly not the lock.** On free-threaded Python a thread that reads an object it
+did not create updates the object's reference count atomically, so threads that read the same
+objects on every write fight over their cache lines. Measured in isolation on this machine:
+
+| Per iteration, every thread | 1 thread | 2 | 4 | 8 |
+| --- | --- | --- | --- | --- |
+| Read an attribute holding a shared object | 8 ns | 123 ns | 505 ns | 1,154 ns |
+| The same, holding an object the thread owns | 7 ns | 8 ns | 9 ns | 15 ns |
+| Take and release one shared lock | 38 ns | 81 ns | 183 ns | 438 ns |
+| Take and release a lock of one's own | 38 ns | 39 ns | 40 ns | 58 ns |
+
+Every write read dozens of shared objects: the engine and its lock, the batch lists, the
+serializer's plans, cached tag sets and field prefixes, the `FieldType` members compared for
+every field, ints above 256 (`2**63 - 1`, the batch size), the `tag_context` variable.
+Functions, classes, modules, `threading.local` objects, interned strings, small ints and
+code constants are exempt (immortal or reference counted per thread).
+
+**What changed.**
+
+- *Lanes.* The engine buffers each thread's writes in a lane of its own: its open batches, a
+  lock (which also guards the futures of the writes buffered there) and some reserved buffer
+  space. A write takes only its lane's lock; the engine lock is taken once per batch, to open
+  and to seal it. Batches enter and leave lanes under both locks, so `flush()`, `close()`, the
+  flusher and fork handling always find every buffered line, and `close()` marks lanes
+  unusable, so a write racing it either has its lines sealed or fails with
+  `ClientClosedError`. Merged requests release each lane's futures under that lane's lock,
+  512 at a time. A lane that opened no batch for 30 s is unregistered (its thread may be
+  gone) and registers again when used. With the GIL, and with `concurrency = 1` (whose
+  promise is that requests leave in the order the lines were written), all threads share one
+  lane, as before.
+- *Backpressure by credit.* A lane reserves buffer space ahead (64 KiB, or 1/256 of
+  `max_pending_bytes` when that is smaller), so `max_pending_bytes` still bounds the buffer
+  exactly: reserved space counts as used. Before a full buffer drops or refuses a write, the
+  space lanes reserved and did not use is taken back, and a lane returns it when its last open
+  batch is sealed, so `buffered_bytes` is exact once data is flushed. Waiting for space never
+  holds a lane's lock (the senders need it to release the futures that free the space).
+- *Serializer views.* Plans (type locks, the tag and field keys written) are shared and change
+  under one lock; each thread serializes through a view with caches of its own, keeping the
+  field's expected type as an immortal string and field prefixes, tag fragments and tag sets
+  as strings it created itself. A record's changes to the shared plans are now made only once
+  it is written, and checked again then: if another thread locked the field to another type,
+  or wrote a tag key as a field, in the meantime, the record is serialized again against that
+  decision. Before, a rejected record's locks were taken back afterwards, and another thread
+  could act on them in between. Types the server reports are pushed to every view.
+- *The rest of the path.* The client finds the calling thread's view and lane through a
+  `threading.local`; the default database and precision are interned; the `tag_context`
+  variable is read only once `tag_context()` was ever used.
+
+**Integrity.** New tests (`tests/unit/test_threads.py`, each run with per-thread and with shared
+state on every build) race six writers against repeated `flush()` (every write that returned
+before a flush is acknowledged when it returns), against `close()` (everything accepted is sent
+exactly once, everything else refused), and against `fork()` with writers holding their lanes'
+locks; check that blocked writers never exceed `max_pending_bytes`, that drops plus writes add
+up, that space reserved by 400 idle threads drops nothing, that lanes are unregistered and come
+back, and that racing first writes of a field (or of a tag and field of one name) never let two
+types (or both) through. Seven bugs planted in turn (no credit reclaim, no view invalidation, no
+lock reset after fork, no commit checks of types or of tag keys, `close()` leaving lanes usable,
+`flush()` not sealing lanes) each fail at least one test. The whole suite also runs with
+per-thread state on the GIL build, in a new CI job. Every `bench_client.py` run below checked
+that each line arrived exactly once.
+
+**Results** (`bench_client.py --threads 2,4,8,16`, 300,000 points, median of 4 runs alternating
+before/after):
+
+| One `write()` per point | 3.14t before | 3.14t after | 3.14 before | 3.14 after |
+| --- | --- | --- | --- | --- |
+| 1 thread | 394 k | 402 k | 363 k | 373 k |
+| 2 threads | 270 k | 646 k | 361 k | 373 k |
+| 4 threads | 255 k | 1,071 k | 360 k | 368 k |
+| 8 threads | 198 k | 1,613 k | 356 k | 368 k |
+| 16 threads | 176 k | 1,914 k | 352 k | 362 k |
+
+Lists of dicts, 10 points per call and DataFrames are unchanged on both builds (within the
+2% the runs vary by), and so is serialization alone with the GIL (`bench_serialize.py`,
+alternating runs). Without the network, `submit()` now goes 1.55 M/s on one thread and 4.1 M/s
+on eight, and a shared serializer 661 k -> 3.2 M points/s from one thread to eight. The M5 Pro
+has six fast cores, so each thread beyond six adds less.
+
+`bench_client.py`'s sink now accepts 128 pending connections instead of 5: when a flush
+releases many batches at once, the client's 16 senders connect together, and the dropped
+connection attempts cost a second each in TCP retries (16 threads otherwise measured 250 k).
+
+**Cost.** On free-threaded Python every writing thread keeps serializer caches of its own, so
+memory for them grows with the number of threads that write many distinct series (each cache
+keeps its limit: 50,000 tag sets per measurement, 200,000 tag fragments).
+
 ## Investigated, not changed
 
 - **Float formatting is the floor.** `repr()` of a float costs ~170 ns and is the only exact,
@@ -117,22 +212,13 @@ busy 22% less.
 
 ## Recommendations
 
-1. **Scale writes across threads on free-threaded Python.** Several threads writing through
-   one client are slower than one there: one `write()` per point went 401 k points/s with one
-   thread, 256 k with two, 189 k with eight (5.2 cores busy). `submit()` alone went from
-   1.28 M/s on one thread to 355 k/s on eight: every write takes the engine lock, and the
-   batch lists are shared. A per-thread staging buffer, sealed under its own lock by the
-   owner and reachable by `flush()`, `close()` and the flusher, would remove most of it. The
-   serializer's shared caches cost too (a per-thread serializer scaled where a shared one did
-   not). This touches the buffer accounting and flush semantics, so it deserves its own
-   change.
-2. **Isolate bad lines on InfluxDB 2.** A line the server cannot parse fails its whole request
-   with HTTP 400, taking other callers' points with it, and replaying the `WriteFailure`
-   fails again. Client validation prevents this for records, but raw line protocol passes
-   through unchecked by default. Splitting such a batch in halves (as for HTTP 413) would
-   write every valid line and report only the bad ones.
-3. **A keep-alive fake server for the unit tests**, so they exercise connection reuse and
-   cannot run out of ports (see above).
+1. **Scale writes across threads on free-threaded Python.** Done: see "Writes from many
+   threads on free-threaded Python" above.
+2. **Isolate bad lines on InfluxDB 2.** Done: the client takes out the lines InfluxDB 2
+   quotes and sends the rest again (halving when the quotes do not match), does the same on
+   InfluxDB 3's `/api/v2/write`, and rejects at `write()` lines the server would read into
+   the next.
+3. **A keep-alive fake server for the unit tests.** Done.
 4. A polars `UInt64` column with `int_as_float` is written as unsigned integers, while the row
    path writes the same values as floats: harmless (type locks catch the mix), but
    inconsistent.
